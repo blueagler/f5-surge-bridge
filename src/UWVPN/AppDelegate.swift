@@ -14,11 +14,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var networkDebounce: DispatchWorkItem?
     private var lastPathSatisfied: Bool?
 
-    private var legacyLaunchAgentURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/LaunchAgents/\(UWConfig.legacyLaunchAgentLabel).plist")
-    }
-
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         do {
@@ -211,7 +206,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(autoItem)
 
         let loginItem = NSMenuItem(title: "Launch UWVPN at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
-        loginItem.state = isLaunchAtLoginEnabled() ? .on : .off
+        loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
         loginItem.target = self
         menu.addItem(loginItem)
 
@@ -220,11 +215,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let quit = NSMenuItem(title: "Quit UWVPN (Keep Session Cached)", action: #selector(quitApp), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
-    }
-
-    private func isLaunchAtLoginEnabled() -> Bool {
-        if SMAppService.mainApp.status == .enabled { return true }
-        return FileManager.default.fileExists(atPath: legacyLaunchAgentURL.path)
     }
 
     @objc private func connectAction() {
@@ -313,7 +303,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleLaunchAtLogin() {
-        try? FileManager.default.removeItem(at: legacyLaunchAgentURL)
         do {
             if SMAppService.mainApp.status == .enabled {
                 try SMAppService.mainApp.unregister()

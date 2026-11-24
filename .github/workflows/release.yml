@@ -49,12 +49,12 @@ jobs:
       - name: Cache portable OpenConnect
         uses: actions/cache@v6
         with:
-          path: build/helpers-${{ matrix.arch }}/bin/openconnect
-          key: openconnect-${{ matrix.os }}-${{ steps.toolchain.outputs.version }}-${{ hashFiles('scripts/build-helpers.sh') }}
+          path: |
+            build/helpers-${{ matrix.arch }}/bin/openconnect
+            build/helpers-${{ matrix.arch }}/licenses
+          key: openconnect-${{ matrix.os }}-${{ steps.toolchain.outputs.version }}-${{ hashFiles('scripts/build-helpers.sh', 'src/UWVPN/Info.plist') }}
 
       - name: Build and sign app
-        env:
-          UWVPN_BUILD_OPENSSL: '1'
         run: ./scripts/build-app.sh '${{ matrix.arch }}'
 
       - name: Test tunnel and validate app

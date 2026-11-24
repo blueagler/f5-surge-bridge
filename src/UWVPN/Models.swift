@@ -13,27 +13,18 @@ struct UWGateway: Codable, Hashable {
     var title: String { "\(name) (\(gatewayHost))" }
     var shortLabel: String { name }
     var publishesSplitRules: Bool { splitRules == true }
-    var isUWPreset: Bool { legacyAccount != nil }
-    var ruleFileStem: String { legacyAccount == "campus" ? "uw" : "uw-\(webStoreUUID.uuidString.lowercased())" }
+    var isUWPreset: Bool { [Self.allInternet.gatewayHost, Self.campusOnly.gatewayHost].contains(gatewayHost) }
+    var ruleFileStem: String { "uw-\(webStoreUUID.uuidString.lowercased())" }
 
     var gatewayHost: String {
         gatewayURL.host!.lowercased()
     }
 
-    private var legacyAccount: String? {
-        [Self.allInternet, Self.campusOnly].first { $0.id == id && $0.gatewayHost == gatewayHost }?.id
-    }
-
-    var sessionAccount: String { legacyAccount ?? "\(id)@\(gatewayHost)" }
+    var sessionAccount: String { "\(id)@\(gatewayHost)" }
 
     var webStoreUUID: UUID {
-        switch legacyAccount {
-        case "all": return UUID(uuidString: "A5428E7A-3C2D-4C86-9F6A-3B57C36A1002")!
-        case "campus": return UUID(uuidString: "A5428E7A-3C2D-4C86-9F6A-3B57C36A1001")!
-        default:
-            let b = Array(SHA256.hash(data: Data(sessionAccount.utf8)).prefix(16))
-            return UUID(uuid: (b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]))
-        }
+        let b = Array(SHA256.hash(data: Data(sessionAccount.utf8)).prefix(16))
+        return UUID(uuid: (b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]))
     }
 }
 
@@ -195,7 +186,6 @@ enum UWConfig {
     static let linuxUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     static let campusTestURL = "https://husky-onnet-test.uw.edu/vpn-test/"
     static let publicIPTestURL = "https://api.ipify.org/"
-    static let legacyLaunchAgentLabel = "com.blueagle.uwvpn"
     static let surgeCLIPath = "/Applications/Surge.app/Contents/Applications/surge-cli"
     static let supportDirectory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/UWVPN")
 }

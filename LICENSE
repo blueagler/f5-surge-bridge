@@ -24,6 +24,6 @@ SOFTWARE.
 
 Third-party components bundled in prebuilt releases:
 - OpenConnect (https://www.infradead.org/openconnect/) — LGPL-2.1-only
-- ocproxy (https://github.com/cernekee/ocproxy) — BSD-3-Clause
-- libevent (https://libevent.org/) — BSD-3-Clause
 - OpenSSL (https://www.openssl.org/) — Apache-2.0
+- Go (https://go.dev/) — BSD-3-Clause
+- gVisor (https://gvisor.dev/) — Apache-2.0

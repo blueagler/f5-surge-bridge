@@ -13,14 +13,7 @@ enum SurgeModule {
         }
         let installed = try? command(["module", "show", name])
         let destination = try moduleURL(installed: installed)
-        guard let template = Bundle.main.url(forResource: "uw-vpn.sgmodule", withExtension: "template") else {
-            throw ConfigurationError("Missing bundled Surge module template.")
-        }
-        let source = try String(contentsOf: template, encoding: .utf8)
-        guard let header = source.range(of: "[Rule]\n") else {
-            throw ConfigurationError("Invalid bundled Surge module template.")
-        }
-        let module = try render(header: String(source[..<header.upperBound]), configuration: configuration, support: UWConfig.supportDirectory)
+        let module = try render(configuration: configuration, support: UWConfig.supportDirectory)
         let previous = FileManager.default.fileExists(atPath: destination.path) ? try Data(contentsOf: destination) : nil
         if let previous, !previous.starts(with: Data("#!name=\(name)\n".utf8)) {
             throw ConfigurationError("A different module already exists at \(destination.path).")
@@ -51,7 +44,7 @@ enum SurgeModule {
         return "\(destination.path)\n\nFor UDP, set udp-relay=true on UW-VPN in the active Mac profile."
     }
 
-    static func render(header: String, configuration: GatewayConfiguration, support: URL) throws -> String {
+    private static func render(configuration: GatewayConfiguration, support: URL) throws -> String {
         var rules = configuration.bypassHosts.map { "DOMAIN,\($0),DIRECT" }
         if let gateway = configuration.gateways.first(where: \.publishesSplitRules) {
             try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
@@ -66,7 +59,15 @@ enum SurgeModule {
                 rules.append("RULE-SET,\(file.path),\(policy)")
             }
         }
-        return header + rules.joined(separator: "\n") + "\n"
+        return """
+        #!name=\(name)
+        #!desc=Route VPN split rules and send configured login hosts direct
+        #!system=mac
+
+        [Rule]
+        \(rules.joined(separator: "\n"))
+
+        """
     }
 
     private static func moduleURL(installed: String?) throws -> URL {

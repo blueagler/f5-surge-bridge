@@ -6,6 +6,7 @@ arch="${1:-$(uname -m)}"
 helpers_dir="${2:-$repo_root/build/helpers-$arch}"
 app_out="${3:-$repo_root/dist/UWVPN.app}"
 src_dir="$repo_root/src/UWVPN"
+min_macos=$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$src_dir/Info.plist")
 
 case "$arch" in
     arm64) go_arch=arm64 ;;
@@ -16,7 +17,7 @@ if ! command -v go >/dev/null; then
     print -u2 "Go 1.27.3 or newer is required to build tun-socks."
     exit 1
 fi
-if [[ ! -x "$helpers_dir/bin/openconnect" ]]; then
+if [[ ! -x "$helpers_dir/bin/openconnect" || ! -f "$helpers_dir/licenses/OpenConnect.txt" || ! -f "$helpers_dir/licenses/OpenSSL.txt" ]]; then
     "$repo_root/scripts/build-helpers.sh" "$arch" "$helpers_dir"
 fi
 helpers_dir="${helpers_dir:A}"
@@ -32,11 +33,12 @@ cp "$src_dir/Info.plist" "$app_out/Contents/Info.plist"
 cp "$helpers_dir/bin/openconnect" "$app_out/Contents/Resources/bin/openconnect"
 cp "$helpers_dir/bin/tun-socks" "$app_out/Contents/Resources/bin/tun-socks"
 cp "$src_dir/tun-bridge.sh" "$app_out/Contents/Resources/bin/tun-bridge.sh"
-cp "$repo_root/surge/uw-vpn.sgmodule.template" "$app_out/Contents/Resources/uw-vpn.sgmodule.template"
 chmod 755 "$app_out/Contents/Resources/bin/"{openconnect,tun-socks,tun-bridge.sh}
 
 licenses_dir="${app_out:A}/Contents/Resources/Licenses"
 mkdir -p "$licenses_dir/go"
+cp "$helpers_dir/licenses/"{OpenConnect,OpenSSL}.txt "$licenses_dir/"
+cp "$repo_root/LICENSE" "$licenses_dir/UWVPN.txt"
 (
     cd "$repo_root/src/tun-socks"
     cp "$(go env GOROOT)/"{LICENSE,PATENTS} "$licenses_dir/go/"
@@ -54,7 +56,7 @@ mkdir -p "$licenses_dir/go"
         done
 )
 
-xcrun swiftc -target "${arch}-apple-macos14.0" -swift-version 5 -warnings-as-errors -O \
+xcrun swiftc -target "${arch}-apple-macos${min_macos}" -swift-version 5 -warnings-as-errors -O \
     -framework AppKit -framework Network -framework WebKit -framework Security -framework ServiceManagement \
     -o "$app_out/Contents/MacOS/UWVPN" \
     "$src_dir/Models.swift" "$src_dir/KeychainStore.swift" "$src_dir/GatewayRelay.swift" \

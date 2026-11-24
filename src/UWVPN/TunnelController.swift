@@ -19,7 +19,6 @@ final class TunnelRunner {
 
     private var generation: UInt64 = 0
     private var process: Process?
-    private var processGeneration: UInt64 = 0
     private var stopIntent: StopIntent = .none
     private var stopKillTimer: DispatchWorkItem?
     private var stopWaiters: [() -> Void] = []
@@ -30,7 +29,6 @@ final class TunnelRunner {
     private var activeLogin: WebLoginController?
     private var clearingWebDataGateways: Set<UWGateway> = []
     private var cachedSessions: [UWGateway: StoredSession] = [:]
-    private var lastKeychainError: String?
 
     private var desiredConnected = false
     private var networkOnline = true
@@ -256,8 +254,7 @@ final class TunnelRunner {
             } else {
                 cachedSessions.removeValue(forKey: gateway)
             }
-        case .failure(let err):
-            lastKeychainError = err.localizedDescription
+        case .failure:
             cachedSessions.removeValue(forKey: gateway)
         }
     }
@@ -354,7 +351,6 @@ final class TunnelRunner {
         proc.standardError = stderrPipe
 
         self.process = proc
-        self.processGeneration = gen
 
         stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
