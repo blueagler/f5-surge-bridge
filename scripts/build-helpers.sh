@@ -37,8 +37,10 @@ logged() {
 }
 
 cd "$work_dir"
+source_dir=$(mktemp -d "$work_dir/sources.XXXXXXXX")
+trap 'rm -rf -- "$source_dir"' EXIT
 
-openssl_dir="$work_dir/openssl-install"
+openssl_dir="$source_dir/openssl-${OPENSSL_VER}"
 case "$arch" in
     arm64) openssl_target=darwin64-arm64-cc ;;
     x86_64) openssl_target=darwin64-x86_64-cc ;;
@@ -47,13 +49,12 @@ esac
 fetch_and_verify \
     "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VER}/openssl-${OPENSSL_VER}.tar.gz" \
     "openssl-${OPENSSL_VER}.tar.gz" "$OPENSSL_SHA256"
-/usr/bin/tar -xzf "openssl-${OPENSSL_VER}.tar.gz"
+/usr/bin/tar -xzf "openssl-${OPENSSL_VER}.tar.gz" -C "$source_dir"
 (
-    cd "openssl-${OPENSSL_VER}"
+    cd "$openssl_dir"
     logged configure.log /usr/bin/perl Configure "$openssl_target" no-shared no-tests no-apps \
-        "-mmacosx-version-min=$min_macos" --prefix="$openssl_dir"
+        "-mmacosx-version-min=$min_macos"
     logged build.log /usr/bin/make -j "$jobs" AR=/usr/bin/ar 'RANLIB=/usr/bin/ranlib -c' build_libs
-    logged install.log /usr/bin/make AR=/usr/bin/ar 'RANLIB=/usr/bin/ranlib -c' install_dev
 )
 
 if ! pkgconf_bin=$(command -v pkgconf || command -v pkg-config); then
@@ -62,9 +63,9 @@ if ! pkgconf_bin=$(command -v pkgconf || command -v pkg-config); then
         fetch_and_verify \
             "https://distfiles.ariadne.space/pkgconf/pkgconf-${PKGCONF_VER}.tar.xz" \
             "pkgconf-${PKGCONF_VER}.tar.xz" "$PKGCONF_SHA256"
-        /usr/bin/tar -xf "pkgconf-${PKGCONF_VER}.tar.xz"
+        /usr/bin/tar -xf "pkgconf-${PKGCONF_VER}.tar.xz" -C "$source_dir"
         (
-            cd "pkgconf-${PKGCONF_VER}"
+            cd "$source_dir/pkgconf-${PKGCONF_VER}"
             logged configure.log ./configure --prefix="$work_dir/tools"
             logged build.log /usr/bin/make -j "$jobs"
             logged install.log /usr/bin/make install
@@ -77,16 +78,16 @@ fetch_and_verify \
     "https://www.infradead.org/openconnect/download/openconnect-${OPENCONNECT_VER}.tar.gz" \
     "openconnect-${OPENCONNECT_VER}.tar.gz" \
     "$OPENCONNECT_SHA256"
-/usr/bin/tar -xzf "openconnect-${OPENCONNECT_VER}.tar.gz"
+/usr/bin/tar -xzf "openconnect-${OPENCONNECT_VER}.tar.gz" -C "$source_dir"
 (
-    cd "openconnect-${OPENCONNECT_VER}"
+    cd "$source_dir/openconnect-${OPENCONNECT_VER}"
     # Keep runner-installed packages out of the app's runtime dependencies.
     logged configure.log env AR=/usr/bin/ar RANLIB=/usr/bin/ranlib PKG_CONFIG="$pkgconf_bin" \
         PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$work_dir/empty-pkgconfig" \
         CC="/usr/bin/clang -arch $arch" \
         CFLAGS="-O2 -mmacosx-version-min=$min_macos" \
         OPENSSL_CFLAGS="-I$openssl_dir/include" \
-        OPENSSL_LIBS="$openssl_dir/lib/libssl.a $openssl_dir/lib/libcrypto.a -lpthread" \
+        OPENSSL_LIBS="-L$openssl_dir -lssl -lcrypto -lpthread" \
         LIBXML2_CFLAGS="-I$sdk/usr/include/libxml2" \
         LIBXML2_LIBS="-lxml2" \
         ZLIB_CFLAGS="-I$sdk/usr/include" \
@@ -108,5 +109,5 @@ if otool -L "$bin" | tail -n +2 | grep -qvE '^[[:space:]]+(/usr/lib/|/System/)';
     print -u2 "ERROR: $bin links non-system libraries!"
     exit 1
 fi
-cp "openconnect-${OPENCONNECT_VER}/COPYING.LGPL" "$out_dir/licenses/OpenConnect.txt"
-cp "openssl-${OPENSSL_VER}/LICENSE.txt" "$out_dir/licenses/OpenSSL.txt"
+cp "$source_dir/openconnect-${OPENCONNECT_VER}/COPYING.LGPL" "$out_dir/licenses/OpenConnect.txt"
+cp "$openssl_dir/LICENSE.txt" "$out_dir/licenses/OpenSSL.txt"
