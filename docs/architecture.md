@@ -14,18 +14,19 @@ F5 Access for macOS (`2.1.1`) uses Network Extension (`PacketTunnel` + `DNSProxy
    - Listens on `127.0.0.1:<ephemeral>`.
    - Allows `CONNECT` only to configured F5 gateway hosts (`huskyonnet-ns.uw.edu:443`, `huskyonnet.uw.edu:443`).
    - Reads active physical `en*` interface and DHCP DNS servers directly via `SystemConfiguration` (`SCDynamicStore`).
-   - If system DNS returns Surge's `198.18.0.0/15` fake-IP range, performs direct UDP DNS lookup over `IP_BOUND_IF` on the physical NIC.
-   - Connects outbound TCP sockets bound with `IP_BOUND_IF` so neither WebKit login nor OpenConnect loops through Surge VIF.
+   - Queries A and AAAA via DNS sockets bound to the physical NIC. System resolver fallback rejects Surge's IPv4 and IPv6 fake addresses.
+   - Binds outbound TCP sockets to the physical NIC with `IP_BOUND_IF` for IPv4 and `IPV6_BOUND_IF` for IPv6.
 
 2. **WebKit SAML + Duo Login (`WebLoginWindow.swift`)**
    - Uses a persistent per-gateway `WKWebsiteDataStore(forIdentifier:)` so UW IdP / Duo trust cookies survive restarts.
    - Sends a Linux browser `User-Agent` to bypass UW APM's macOS browser block and enter the SAML + Duo flow directly.
    - Watches `WKHTTPCookieStore` for `MRHSession` + `F5_ST` (rejecting `"deleted"` sentinels) and persists them in macOS Keychain (`KeychainStore.swift`).
 
-3. **OpenConnect + `ocproxy` Userspace Tunnel (`TunnelController.swift` + `tun-bridge.sh`)**
+3. **OpenConnect + gVisor Userspace Tunnel (`TunnelController.swift`, `tun-bridge.sh`, `src/tun-socks/`)**
    - Passes the cookie via `--cookie-on-stdin` (never argv/disk).
-   - Runs `openconnect --protocol=f5 --no-dtls --script-tun` with `tun-bridge.sh` -> `ocproxy -D 11080 -k 15`.
-   - `tun-bridge.sh` reads OpenConnect's server-derived `CISCO_SPLIT_INC_*`, `CISCO_SPLIT_EXC_*`, and `CISCO_DEF_DOMAIN` environment variables to regenerate Surge's `uw-split.list` and `uw-exclude.list`.
+   - Runs `openconnect --protocol=f5 --no-dtls --script-tun`. Its script starts `tun-socks`, which exchanges raw IP datagrams with OpenConnect over `VPNFD`.
+   - `tun-socks` exposes loopback SOCKS5 `CONNECT` and `UDP ASSOCIATE`. It resolves SOCKS5 destinations through F5-provided DNS and forwards them through the userspace IPv4/IPv6 stack.
+   - `tun-bridge.sh` uses server-provided IPv4 and IPv6 includes/excludes and `CISCO_DEF_DOMAIN` to generate Surge rules for the configured split gateway.
    - **Clean Detach (`SIGHUP`) vs Logout (`SIGTERM`)**: normal disconnect and app quit send `SIGHUP` (`OC_CMD_DETACH`), preserving the server session so cached Keychain credentials reconnect without Duo until `F5_ST` expires (~72h). Explicit **Sign Out** sends `SIGTERM` / `/vdesk/hangup.php3?hangup_error=1` and wipes Keychain + WebKit data.
    - **Keepalive**: periodically requests `/vdesk/timeoutagent-i.php` over the physical-NIC relay to refresh session state and detect server hangup.
 

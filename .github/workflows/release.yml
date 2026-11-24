@@ -18,12 +18,17 @@ jobs:
       matrix:
         include:
           - arch: arm64
-            os: macos-14
+            os: macos-15
           - arch: x86_64
             os: macos-15-intel
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: src/tun-socks/go.mod
+          cache-dependency-path: src/tun-socks/go.sum
 
       - name: Install OpenSSL static libs via Homebrew
         run: brew install openssl@3 pkgconf
@@ -37,6 +42,7 @@ jobs:
 
       - name: Verify tun-bridge.sh and app bundle
         run: |
+          (cd src/tun-socks && go test -mod=readonly ./...)
           /bin/zsh -n src/UWVPN/tun-bridge.sh
           codesign --verify --deep --strict "dist/UWVPN-${{ matrix.arch }}/UWVPN.app"
           ditto -c -k --sequesterRsrc --keepParent "dist/UWVPN-${{ matrix.arch }}/UWVPN.app" "dist/UWVPN-macOS-${{ matrix.arch }}.zip"
@@ -49,7 +55,7 @@ jobs:
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -61,7 +67,7 @@ jobs:
           ditto -x -k artifacts/UWVPN-macOS-arm64/UWVPN-macOS-arm64.zip dist/arm64
           ditto -x -k artifacts/UWVPN-macOS-x86_64/UWVPN-macOS-x86_64.zip dist/x86_64
           cp -R dist/arm64/UWVPN.app dist/universal/UWVPN.app
-          for rel in Contents/MacOS/UWVPN Contents/Resources/bin/openconnect Contents/Resources/bin/ocproxy; do
+          for rel in Contents/MacOS/UWVPN Contents/Resources/bin/openconnect Contents/Resources/bin/tun-socks; do
             lipo -create \
               "dist/arm64/UWVPN.app/$rel" \
               "dist/x86_64/UWVPN.app/$rel" \

@@ -10,6 +10,7 @@ final class TunnelRunner {
     }
 
     private let relay: GatewayRelay
+    private let configuration: GatewayConfiguration
     private let onStateChange: () -> Void
 
     private(set) var state: TunnelState = .disconnected {
@@ -46,10 +47,10 @@ final class TunnelRunner {
     var selectedGateway: UWGateway {
         get {
             if let raw = UserDefaults.standard.string(forKey: selectedGatewayKey),
-               let gw = UWGateway(rawValue: raw) {
+               let gw = configuration.gateways.first(where: { $0.id == raw }) {
                 return gw
             }
-            return .allInternet
+            return configuration.defaultSelection
         }
         set {
             guard newValue != selectedGateway else { return }
@@ -57,7 +58,7 @@ final class TunnelRunner {
             if wasUp {
                 disconnect(logoutOnServer: false)
             }
-            UserDefaults.standard.set(newValue.rawValue, forKey: selectedGatewayKey)
+            UserDefaults.standard.set(newValue.id, forKey: selectedGatewayKey)
             onStateChange()
             if wasUp {
                 connect(forceLogin: false)
@@ -73,10 +74,11 @@ final class TunnelRunner {
         }
     }
 
-    init(relay: GatewayRelay, onStateChange: @escaping () -> Void) {
+    init(relay: GatewayRelay, configuration: GatewayConfiguration, onStateChange: @escaping () -> Void) {
         self.relay = relay
+        self.configuration = configuration
         self.onStateChange = onStateChange
-        for gw in UWGateway.allCases {
+        for gw in configuration.gateways {
             reloadKeychainCache(for: gw)
         }
     }
@@ -318,6 +320,7 @@ final class TunnelRunner {
         let openconnectPath = "\(resourceDir)/bin/openconnect"
         let bridgePath = "\(resourceDir)/bin/tun-bridge.sh"
         guard FileManager.default.isExecutableFile(atPath: openconnectPath),
+              FileManager.default.isExecutableFile(atPath: "\(resourceDir)/bin/tun-socks"),
               FileManager.default.isExecutableFile(atPath: bridgePath) else {
             state = .error("Missing bundled VPN helpers")
             desiredConnected = false
@@ -329,7 +332,8 @@ final class TunnelRunner {
         stderrBuffer.removeAll(keepingCapacity: true)
         lastPhysicalInterface = relay.currentPhysicalInterfaceName()
 
-        let scriptCmd = "\(Self.shellQuote(bridgePath)) \(Self.shellQuote(gateway.rawValue)) \(UWConfig.socksPort)"
+        let splitStem = gateway.publishesSplitRules ? gateway.ruleFileStem : ""
+        let scriptCmd = "exec \(Self.shellQuote(bridgePath)) \(Self.shellQuote(gateway.id)) \(UWConfig.socksPort) \(Self.shellQuote(splitStem))"
         let proc = Process()
         let stdinPipe = Pipe()
         let stderrPipe = Pipe()
@@ -410,8 +414,8 @@ final class TunnelRunner {
                 if ready {
                     self.reconnectAttempts = 0
                     self.state = .connected(since: Date())
-                    if gateway == .campusOnly {
-                        self.refreshSurgeIfSplitRulesChanged()
+                    if gateway.publishesSplitRules {
+                        self.refreshSurgeIfSplitRulesChanged(gateway: gateway)
                     }
                     return
                 }
@@ -658,32 +662,35 @@ final class TunnelRunner {
                 }
             }
 
-            let (uwCode, uwBody) = curlViaSocks(UWConfig.campusTestURL)
-            let uwLine = (uwCode == 0 && uwBody.contains("Success!"))
-                ? "Campus resource test: Success!"
-                : "Campus resource test: Failed (exit \(uwCode))"
+            var lines = ["Gateway: \(gw.title)"]
+            if gw.isUWPreset {
+                let (uwCode, uwBody) = curlViaSocks(UWConfig.campusTestURL)
+                lines.append(uwCode == 0 && uwBody.contains("Success!")
+                             ? "Campus resource test: Success!"
+                             : "Campus resource test: Failed (exit \(uwCode))")
+            }
 
             let (ipCode, ipBody) = curlViaSocks(UWConfig.publicIPTestURL)
             let trimmedIP = ipBody.trimmingCharacters(in: .whitespacesAndNewlines)
             let ipLine: String
             if ipCode == 0 && !trimmedIP.isEmpty {
-                ipLine = "Public egress via UW: \(trimmedIP)"
-            } else if gw == .campusOnly {
-                ipLine = "Public egress via UW: Blocked (expected in Campus Only mode)"
+                ipLine = "Public egress via VPN: \(trimmedIP)"
+            } else if gw.publishesSplitRules {
+                ipLine = "Public egress via VPN: Unavailable (the gateway may restrict public traffic)"
             } else {
-                ipLine = "Public egress via UW: Failed (exit \(ipCode))"
+                ipLine = "Public egress via VPN: Failed (exit \(ipCode))"
             }
 
-            let summary = "Gateway: \(gw.title)\n\(uwLine)\n\(ipLine)"
+            let summary = (lines + [ipLine]).joined(separator: "\n")
             DispatchQueue.main.async { completion(summary) }
         }
     }
 
-    private func refreshSurgeIfSplitRulesChanged() {
+    private func refreshSurgeIfSplitRulesChanged(gateway: UWGateway) {
         guard !surgeReloadInFlight else { return }
-        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/UWVPN")
-        let splitText = (try? String(contentsOf: dir.appendingPathComponent("uw-split.list"), encoding: .utf8)) ?? ""
-        let excText = (try? String(contentsOf: dir.appendingPathComponent("uw-exclude.list"), encoding: .utf8)) ?? ""
+        let dir = UWConfig.supportDirectory
+        let splitText = (try? String(contentsOf: dir.appendingPathComponent("\(gateway.ruleFileStem)-split.list"), encoding: .utf8)) ?? ""
+        let excText = (try? String(contentsOf: dir.appendingPathComponent("\(gateway.ruleFileStem)-exclude.list"), encoding: .utf8)) ?? ""
         let normalized = [splitText, excText]
             .flatMap { $0.split(separator: "\n") }
             .filter { !$0.hasPrefix("#") }

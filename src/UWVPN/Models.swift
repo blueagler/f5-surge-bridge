@@ -1,46 +1,108 @@
+import CryptoKit
 import Foundation
 
-enum UWGateway: String, CaseIterable, Identifiable {
-    case allInternet = "all"
-    case campusOnly = "campus"
+struct UWGateway: Codable, Hashable {
+    let id: String
+    let name: String
+    let gatewayURL: URL
+    let splitRules: Bool?
 
-    var id: String { rawValue }
+    static let allInternet = UWGateway(id: "all", name: "All Internet", gatewayURL: URL(string: "https://huskyonnet-ns.uw.edu/")!, splitRules: false)
+    static let campusOnly = UWGateway(id: "campus", name: "Campus Only", gatewayURL: URL(string: "https://huskyonnet.uw.edu/")!, splitRules: true)
 
-    var title: String {
-        switch self {
-        case .allInternet: return "All Internet (huskyonnet-ns.uw.edu)"
-        case .campusOnly: return "Campus Only (huskyonnet.uw.edu)"
-        }
-    }
-
-    var shortLabel: String {
-        switch self {
-        case .allInternet: return "All Internet"
-        case .campusOnly: return "Campus Only"
-        }
-    }
-
-    var gatewayURL: URL {
-        switch self {
-        case .allInternet: return URL(string: "https://huskyonnet-ns.uw.edu/")!
-        case .campusOnly: return URL(string: "https://huskyonnet.uw.edu/")!
-        }
-    }
+    var title: String { "\(name) (\(gatewayHost))" }
+    var shortLabel: String { name }
+    var publishesSplitRules: Bool { splitRules == true }
+    var isUWPreset: Bool { legacyAccount != nil }
+    var ruleFileStem: String { legacyAccount == "campus" ? "uw" : "uw-\(webStoreUUID.uuidString.lowercased())" }
 
     var gatewayHost: String {
         gatewayURL.host!.lowercased()
     }
 
-    var webStoreUUID: UUID {
-        switch self {
-        case .allInternet: return UUID(uuidString: "A5428E7A-3C2D-4C86-9F6A-3B57C36A1002")!
-        case .campusOnly: return UUID(uuidString: "A5428E7A-3C2D-4C86-9F6A-3B57C36A1001")!
-        }
+    private var legacyAccount: String? {
+        [Self.allInternet, Self.campusOnly].first { $0.id == id && $0.gatewayHost == gatewayHost }?.id
     }
 
-    static var allowedGatewayHosts: Set<String> {
-        Set(allCases.map(\.gatewayHost))
+    var sessionAccount: String { legacyAccount ?? "\(id)@\(gatewayHost)" }
+
+    var webStoreUUID: UUID {
+        switch legacyAccount {
+        case "all": return UUID(uuidString: "A5428E7A-3C2D-4C86-9F6A-3B57C36A1002")!
+        case "campus": return UUID(uuidString: "A5428E7A-3C2D-4C86-9F6A-3B57C36A1001")!
+        default:
+            let b = Array(SHA256.hash(data: Data(sessionAccount.utf8)).prefix(16))
+            return UUID(uuid: (b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]))
+        }
     }
+}
+
+struct GatewayConfiguration: Codable {
+    let defaultGateway: String
+    let gateways: [UWGateway]
+    let directHosts: [String]?
+
+    static let presets = GatewayConfiguration(defaultGateway: "all", gateways: [.allInternet, .campusOnly], directHosts: ["idp.u.washington.edu"])
+    static let file = UWConfig.supportDirectory.appendingPathComponent("config.json")
+
+    var defaultSelection: UWGateway { gateways.first { $0.id == defaultGateway }! }
+    var bypassHosts: [String] { Array(Set((gateways.map(\.gatewayHost) + (directHosts ?? [])).map { $0.lowercased() })).sorted() }
+
+    static func load(from file: URL = Self.file) throws -> GatewayConfiguration {
+        let data: Data
+        do {
+            data = try Data(contentsOf: file)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return presets
+        }
+        return try JSONDecoder().decode(Self.self, from: data).validated()
+    }
+
+    static func createIfMissing() throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        try FileManager.default.createDirectory(at: UWConfig.supportDirectory, withIntermediateDirectories: true)
+        do {
+            try encoder.encode(presets).write(to: file, options: .withoutOverwriting)
+        } catch let error as CocoaError where error.code == .fileWriteFileExists {}
+    }
+
+    private func validated() throws -> Self {
+        var ids = Set<String>()
+        for gateway in gateways {
+            let url = gateway.gatewayURL
+            guard gateway.id.range(of: "^[a-zA-Z0-9_-]{1,48}$", options: .regularExpression) != nil,
+                  ids.insert(gateway.id).inserted, !gateway.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  gateway.name.rangeOfCharacter(from: .controlCharacters) == nil,
+                  url.scheme?.lowercased() == "https", url.user == nil,
+                  URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPassword == nil,
+                  url.port == nil || url.port == 443, url.query == nil, url.fragment == nil,
+                  url.path.isEmpty || url.path == "/",
+                  let host = url.host, Self.isHostname(host) else {
+                throw ConfigurationError("Invalid gateway \(gateway.id). Use a unique ID, a display name, and a root HTTPS URL on port 443.")
+            }
+        }
+        guard ids.contains(defaultGateway) else { throw ConfigurationError("defaultGateway must match a gateway ID.") }
+        guard gateways.filter(\.publishesSplitRules).count <= 1 else {
+            throw ConfigurationError("Only one gateway can publish the shared Surge split rules.")
+        }
+        guard (directHosts ?? []).allSatisfy(Self.isHostname) else {
+            throw ConfigurationError("directHosts must contain plain hostnames.")
+        }
+        return self
+    }
+
+    private static func isHostname(_ host: String) -> Bool {
+        !host.isEmpty && host.utf8.count <= 253 && host.split(separator: ".", omittingEmptySubsequences: false).allSatisfy {
+            $0.range(of: "^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$", options: .regularExpression) != nil
+        }
+    }
+}
+
+struct ConfigurationError: LocalizedError {
+    let message: String
+    init(_ message: String) { self.message = message }
+    var errorDescription: String? { message }
 }
 
 struct StoredSession: Codable, Equatable {
@@ -129,11 +191,11 @@ enum UWConfig {
     static let expirySafetyMargin: TimeInterval = 60
     static let keepaliveInterval: TimeInterval = 480
     static let openconnectReconnectTimeoutSec = 300
-    static let ocproxyKeepaliveSec = 15
     static let maxReconnectBackoffSec: TimeInterval = 30
     static let linuxUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     static let campusTestURL = "https://husky-onnet-test.uw.edu/vpn-test/"
     static let publicIPTestURL = "https://api.ipify.org/"
     static let legacyLaunchAgentLabel = "com.blueagle.uwvpn"
     static let surgeCLIPath = "/Applications/Surge.app/Contents/Applications/surge-cli"
+    static let supportDirectory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/UWVPN")
 }

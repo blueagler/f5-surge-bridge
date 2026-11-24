@@ -9,19 +9,16 @@
 5. **WebKit & Keychain robustness**: added `dirty` cookie re-check flag, navigation/renderer failure retry alerts, typed Keychain error handling, removed invented 72h expiry fallback, and switched Launch at Login to `SMAppService.mainApp`.
 6. **Portability**: `scripts/build-helpers.sh` now links `openconnect` against static `libssl.a`/`libcrypto.a` and Apple's system `/usr/lib/libxml2.2.dylib`, `/usr/lib/libz.1.dylib`, `/usr/lib/libiconv.2.dylib` — zero Homebrew/nanobrew runtime dylibs.
 
-## Known Remaining Limitations & Next Milestones
+## Implemented After the Initial Audit
 
-### 1. Replace `ocproxy` (TCP + IPv4 only) with a UDP + IPv6 Userspace Stack
-- `ocproxy` (based on legacy lwIP 1.4) supports only SOCKS5 `CONNECT` over IPv4 TCP (`UDP ASSOCIATE` and IPv6 literals are unimplemented).
-- **Planned fix**: replace `ocproxy` with a self-contained Rust (`smoltcp`) or Go (`gVisor` netstack, e.g. `go-ocproxy`-compatible) `--script-tun` binary supporting `SOCKS5 CONNECT` + `UDP ASSOCIATE` + IPv4/IPv6 dual-stack over `VPNFD`, plus dual-stack `IPV6_BOUND_IF` dialing in `GatewayRelay.swift`.
+- The gVisor helper supports SOCKS5 `CONNECT` and `UDP ASSOCIATE` for both IP families over `VPNFD`. The physical gateway relay supports `IPV6_BOUND_IF` for IPv6 connections.
+- `config.json` supports custom F5 gateways with UW Husky OnNet as the default preset. **Install / Update Surge Module** generates and enables a module using the configured hosts and split rules.
 
-### 2. Configurable Gateways & In-App Surge Setup
-- Move `UWGateway` endpoints from compiled enum defaults into `~/Library/Application Support/UWVPN/config.json` (with UW Husky OnNet as default preset) so any F5 SAML VPN works without recompiling.
-- Add an in-app **"Install / Update Surge Module"** menu item that writes `uw-vpn.sgmodule` with the user's actual `$HOME` path instead of requiring `install-surge-module.sh`.
-
-### 3. End-to-End Verification Checklist
+## End-to-End Verification Checklist
 - [x] `Campus Only` (`huskyonnet.uw.edu`) WebKit SAML + Duo -> `ocproxy` SOCKS5 -> Surge `UW-Campus` -> `Success!`
 - [x] `tun-bridge.sh` verified with 0, 1, and 2 `CISCO_SPLIT_INC`/`EXC` entries
 - [x] Portable `openconnect` & `ocproxy` verified with `otool -L` (Apple OS dylibs only)
+- [x] Local dual-stack TCP and UDP SOCKS5 round trips and tunnel DNS queries with the gVisor helper
+- [ ] Live UDP and IPv6 egress via Husky OnNet and Surge
 - [ ] `All Internet` (`huskyonnet-ns.uw.edu`) end-to-end Duo login + campus test + public egress IP check
 - [ ] Mac sleep/wake + Ethernet <-> Wi-Fi handoff + 72h expiry re-auth test
