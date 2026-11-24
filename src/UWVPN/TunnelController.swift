@@ -1,8 +1,11 @@
 import AppKit
 import Darwin
 import Foundation
+import OSLog
 
 final class TunnelRunner {
+    private static let logger = Logger(subsystem: "com.blueagle.uwvpn", category: "Tunnel")
+
     private enum StopIntent {
         case none
         case detach
@@ -23,6 +26,9 @@ final class TunnelRunner {
     private var stopKillTimer: DispatchWorkItem?
     private var stopWaiters: [() -> Void] = []
     private var readinessTimer: DispatchWorkItem?
+    private var socksHealthTimer: Timer?
+    private var socksHealthProbe: UUID?
+    private var socksHealthFailures = 0
     private var reconnectWorkItem: DispatchWorkItem?
     private var keepaliveTimer: Timer?
     private var keepaliveTask: URLSessionDataTask?
@@ -215,7 +221,7 @@ final class TunnelRunner {
         if ifaceChanged, let proc = process, proc.isRunning {
             // Ask OpenConnect to re-establish over the new physical path, then verify SOCKS5 readiness.
             kill(proc.processIdentifier, SIGUSR2)
-            verifySocksAfterTransition(expectedGeneration: generation)
+            checkSocksHealth(refreshSession: true)
         }
     }
 
@@ -226,21 +232,53 @@ final class TunnelRunner {
             scheduleReconnect(delay: 1.5)
             return
         }
-        verifySocksAfterTransition(expectedGeneration: generation)
+        checkSocksHealth(refreshSession: true)
     }
 
-    private func verifySocksAfterTransition(expectedGeneration gen: UInt64) {
+    private func startSocksHealthMonitoring() {
+        stopSocksHealthMonitoring()
+        let timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+            self?.checkSocksHealth()
+        }
+        timer.tolerance = 0.25
+        socksHealthTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func stopSocksHealthMonitoring() {
+        socksHealthTimer?.invalidate()
+        socksHealthTimer = nil
+        socksHealthProbe = nil
+        socksHealthFailures = 0
+    }
+
+    private func checkSocksHealth(refreshSession: Bool = false) {
+        guard state.isConnected, desiredConnected, stopIntent == .none,
+              socksHealthProbe == nil, let proc = process, proc.isRunning else { return }
+        let gen = generation
+        let probe = UUID()
+        socksHealthProbe = probe
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let ok = Self.probeSocks5Handshake(port: UWConfig.socksPort)
             DispatchQueue.main.async {
-                guard let self, self.generation == gen, self.desiredConnected else { return }
-                if !ok {
-                    self.stopCurrentProcess(intent: .detach) { [weak self] in
-                        guard let self, self.generation == gen, self.desiredConnected else { return }
-                        self.scheduleReconnect(delay: 1.0)
-                    }
-                } else {
-                    self.performKeepalive(expectedGeneration: gen)
+                guard let self, self.socksHealthProbe == probe else { return }
+                self.socksHealthProbe = nil
+                guard self.generation == gen, self.process === proc, proc.isRunning,
+                      self.desiredConnected, self.state.isConnected, self.stopIntent == .none else { return }
+                if ok {
+                    self.socksHealthFailures = 0
+                    if refreshSession { self.performKeepalive(expectedGeneration: gen) }
+                    return
+                }
+
+                self.socksHealthFailures += 1
+                guard self.socksHealthFailures >= 2 else { return }
+                Self.logger.error("SOCKS5 stopped responding while OpenConnect was running. Reconnecting with the saved session.")
+                self.reconnectAttempts += 1
+                self.state = .reconnecting(attempt: self.reconnectAttempts)
+                self.stopCurrentProcess(intent: .detach) { [weak self] in
+                    guard let self, self.generation == gen, self.desiredConnected else { return }
+                    self.scheduleReconnect(delay: 1.0)
                 }
             }
         }
@@ -410,6 +448,7 @@ final class TunnelRunner {
                 if ready {
                     self.reconnectAttempts = 0
                     self.state = .connected(since: Date())
+                    self.startSocksHealthMonitoring()
                     if gateway.publishesSplitRules {
                         self.refreshSurgeIfSplitRulesChanged(gateway: gateway)
                     }
@@ -443,6 +482,7 @@ final class TunnelRunner {
     private func handleProcessExit(process terminated: Process, exitCode: Int32, procGeneration: UInt64, gateway: UWGateway) {
         guard self.process === terminated else { return }
         self.process = nil
+        stopSocksHealthMonitoring()
         stopKillTimer?.cancel()
         stopKillTimer = nil
         readinessTimer?.cancel()
@@ -507,6 +547,7 @@ final class TunnelRunner {
     }
 
     private func stopCurrentProcess(intent: StopIntent, completion: @escaping () -> Void) {
+        stopSocksHealthMonitoring()
         guard let proc = process, proc.isRunning else {
             process = nil
             stopIntent = .none
@@ -765,7 +806,7 @@ final class TunnelRunner {
         guard sent == greeting.count else { return false }
 
         var reply = [UInt8](repeating: 0, count: 2)
-        let n = Darwin.recv(fd, &reply, reply.count, 0)
+        let n = Darwin.recv(fd, &reply, reply.count, MSG_WAITALL)
         return n == 2 && reply[0] == 0x05 && reply[1] == 0x00
     }
 
