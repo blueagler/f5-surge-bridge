@@ -3,87 +3,130 @@ name: Build & Release UWVPN
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: uwvpn-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   build:
+    name: Build ${{ matrix.arch }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: arm64
-            os: macos-15
+            os: macos-26
           - arch: x86_64
-            os: macos-15-intel
+            os: macos-26-intel
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
         with:
-          go-version-file: src/tun-socks/go.mod
+          persist-credentials: false
+
+      - name: Identify native toolchain
+        id: toolchain
+        run: |
+          test "$(uname -m)" = '${{ matrix.arch }}'
+          sdk=$(xcrun --show-sdk-version)
+          xcode=$(xcodebuild -version | awk '/Build version/ { print $3 }')
+          echo "version=$sdk-$xcode" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.4'
           cache-dependency-path: src/tun-socks/go.sum
 
-      - name: Install OpenSSL static libs via Homebrew
-        run: brew install openssl@3 pkgconf
+      - name: Cache portable OpenConnect
+        uses: actions/cache@v6
+        with:
+          path: build/helpers-${{ matrix.arch }}/bin/openconnect
+          key: openconnect-${{ matrix.os }}-${{ steps.toolchain.outputs.version }}-${{ hashFiles('scripts/build-helpers.sh') }}
 
-      - name: Build UWVPN.app (${{ matrix.arch }})
+      - name: Build and sign app
         env:
-          OPENSSL_ROOT_DIR: ${{ matrix.arch == 'arm64' && '/opt/homebrew/opt/openssl@3' || '/usr/local/opt/openssl@3' }}
-        run: |
-          chmod +x scripts/build-helpers.sh scripts/build-app.sh
-          ./scripts/build-app.sh "${{ matrix.arch }}" "build/helpers-${{ matrix.arch }}" "dist/UWVPN-${{ matrix.arch }}/UWVPN.app"
+          UWVPN_BUILD_OPENSSL: '1'
+        run: ./scripts/build-app.sh '${{ matrix.arch }}'
 
-      - name: Verify tun-bridge.sh and app bundle
+      - name: Test tunnel and validate app
         run: |
-          (cd src/tun-socks && go test -mod=readonly ./...)
+          (cd src/tun-socks && CGO_ENABLED=0 go test -mod=readonly ./...)
           /bin/zsh -n src/UWVPN/tun-bridge.sh
-          codesign --verify --deep --strict "dist/UWVPN-${{ matrix.arch }}/UWVPN.app"
-          ditto -c -k --sequesterRsrc --keepParent "dist/UWVPN-${{ matrix.arch }}/UWVPN.app" "dist/UWVPN-macOS-${{ matrix.arch }}.zip"
+          dist/UWVPN.app/Contents/Resources/bin/openconnect --version
+          for executable in Contents/MacOS/UWVPN Contents/Resources/bin/{openconnect,tun-socks}; do
+            test "$(lipo -archs "dist/UWVPN.app/$executable")" = '${{ matrix.arch }}'
+          done
 
-      - uses: actions/upload-artifact@v4
+      - name: Package app
+        run: ditto -c -k --sequesterRsrc --keepParent dist/UWVPN.app 'dist/UWVPN-macOS-${{ matrix.arch }}.zip'
+
+      - uses: actions/upload-artifact@v7
         with:
           name: UWVPN-macOS-${{ matrix.arch }}
           path: dist/UWVPN-macOS-${{ matrix.arch }}.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  universal:
+    name: Assemble Universal app
+    needs: build
+    runs-on: macos-26
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: UWVPN-macOS-*
+          merge-multiple: true
+          path: dist
+
+      - name: Assemble and verify Universal app
+        run: /bin/zsh scripts/build-universal.sh dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: UWVPN-macOS-universal
+          path: dist/UWVPN-macOS-universal.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
 
   release:
+    name: Publish GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
-    runs-on: macos-15
+    needs: universal
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
-          path: artifacts
+          pattern: UWVPN-macOS-*
+          merge-multiple: true
+          path: dist
 
-      - name: Combine Universal UWVPN.app
+      - name: Upload archives to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
         run: |
-          mkdir -p dist/universal
-          ditto -x -k artifacts/UWVPN-macOS-arm64/UWVPN-macOS-arm64.zip dist/arm64
-          ditto -x -k artifacts/UWVPN-macOS-x86_64/UWVPN-macOS-x86_64.zip dist/x86_64
-          cp -R dist/arm64/UWVPN.app dist/universal/UWVPN.app
-          for rel in Contents/MacOS/UWVPN Contents/Resources/bin/openconnect Contents/Resources/bin/tun-socks; do
-            lipo -create \
-              "dist/arm64/UWVPN.app/$rel" \
-              "dist/x86_64/UWVPN.app/$rel" \
-              -output "dist/universal/UWVPN.app/$rel"
-          done
-          codesign --force --deep --sign - dist/universal/UWVPN.app
-          codesign --verify --deep --strict dist/universal/UWVPN.app
-          ditto -c -k --sequesterRsrc --keepParent dist/universal/UWVPN.app dist/UWVPN-macOS-universal.zip
-          cp artifacts/UWVPN-macOS-arm64/UWVPN-macOS-arm64.zip dist/
-          cp artifacts/UWVPN-macOS-x86_64/UWVPN-macOS-x86_64.zip dist/
-
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: |
-            dist/UWVPN-macOS-universal.zip
-            dist/UWVPN-macOS-arm64.zip
-            dist/UWVPN-macOS-x86_64.zip
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/UWVPN-macOS-*.zip --clobber
+          else
+            gh release create "$TAG" dist/UWVPN-macOS-*.zip --verify-tag --generate-notes
+          fi

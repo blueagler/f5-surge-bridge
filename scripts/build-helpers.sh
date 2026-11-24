@@ -1,5 +1,5 @@
 #!/bin/zsh
-set -eu
+set -euo pipefail
 
 repo_root="${0:A:h:h}"
 arch="${1:-$(uname -m)}"
@@ -13,16 +13,26 @@ OPENCONNECT_VER="9.21"
 OPENCONNECT_SHA256="5b32369467db6e5f317aa1ed12cfcbb81ed00bdbc765450b6bfcbdc300944a58"
 PKGCONF_VER="3.0.11"
 PKGCONF_SHA256="d0cd841bc8e55b9da888106c00dc256d05b7d1d8e5a46f4be4eb4c5125bd2dc4"
+OPENSSL_VER="3.5.9"
+OPENSSL_SHA256="603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a"
 
 sdk=$(xcrun --show-sdk-path)
 jobs=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
 fetch_and_verify() {
     local url="$1" dest="$2" expected="$3"
-    if [[ ! -f "$dest" ]]; then
-        /usr/bin/curl -fLsS --max-time 60 -o "$dest" "$url"
+    if [[ -f "$dest" ]] && printf '%s  %s\n' "$expected" "$dest" | /usr/bin/shasum -a 256 -c; then
+        return 0
     fi
-    printf '%s  %s\n' "$expected" "$dest" | /usr/bin/shasum -a 256 -c
+    /usr/bin/curl -fLsS --retry 3 --connect-timeout 10 --max-time 60 -o "$dest.part" "$url"
+    printf '%s  %s\n' "$expected" "$dest.part" | /usr/bin/shasum -a 256 -c
+    mv -f "$dest.part" "$dest"
+}
+
+logged() {
+    local log="$1"
+    shift
+    "$@" > "$log" 2>&1 || { tail -n 80 "$log" >&2; return 1; }
 }
 
 find_openssl_prefix() {
@@ -41,14 +51,31 @@ find_openssl_prefix() {
     return 1
 }
 
-openssl_dir=$(find_openssl_prefix) || {
-    print -u2 "Could not locate static libssl.a/libcrypto.a. Set OPENSSL_ROOT_DIR or install openssl@3."
-    exit 1
-}
+cd "$work_dir"
+
+if [[ "${UWVPN_BUILD_OPENSSL:-0}" != 1 ]] && openssl_dir=$(find_openssl_prefix); then
+    print "Using OpenSSL at $openssl_dir"
+else
+    openssl_dir="$work_dir/openssl-install"
+    case "$arch" in
+        arm64) openssl_target=darwin64-arm64-cc ;;
+        x86_64) openssl_target=darwin64-x86_64-cc ;;
+        *) print -u2 "Unsupported macOS architecture: $arch"; exit 1 ;;
+    esac
+    fetch_and_verify \
+        "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VER}/openssl-${OPENSSL_VER}.tar.gz" \
+        "openssl-${OPENSSL_VER}.tar.gz" "$OPENSSL_SHA256"
+    /usr/bin/tar -xzf "openssl-${OPENSSL_VER}.tar.gz"
+    (
+        cd "openssl-${OPENSSL_VER}"
+        logged configure.log /usr/bin/perl Configure "$openssl_target" no-shared no-tests no-apps \
+            -mmacosx-version-min=14.0 --prefix="$openssl_dir"
+        logged build.log /usr/bin/make -j "$jobs" AR=/usr/bin/ar 'RANLIB=/usr/bin/ranlib -c' build_libs
+        logged install.log /usr/bin/make AR=/usr/bin/ar 'RANLIB=/usr/bin/ranlib -c' install_dev
+    )
+fi
 ln -sf "$openssl_dir/lib/libssl.a" "$work_dir/ossl-static/libssl.a"
 ln -sf "$openssl_dir/lib/libcrypto.a" "$work_dir/ossl-static/libcrypto.a"
-
-cd "$work_dir"
 
 # 1. Build pkgconf if not present
 if ! command -v pkgconf >/dev/null 2>&1 && ! command -v pkg-config >/dev/null 2>&1; then
@@ -59,10 +86,10 @@ if ! command -v pkgconf >/dev/null 2>&1 && ! command -v pkg-config >/dev/null 2>
     /usr/bin/tar -xf "pkgconf-${PKGCONF_VER}.tar.xz"
     (
         cd "pkgconf-${PKGCONF_VER}"
-        CC="/usr/bin/clang -arch $arch" CFLAGS="-O2 -mmacosx-version-min=14.0" \
-            ./configure --prefix="$work_dir/tools" > configure.log 2>&1
-        /usr/bin/make -j "$jobs" > build.log 2>&1
-        /usr/bin/make install >> build.log 2>&1
+        logged configure.log env CC="/usr/bin/clang -arch $arch" CFLAGS="-O2 -mmacosx-version-min=14.0" \
+            ./configure --prefix="$work_dir/tools"
+        logged build.log /usr/bin/make -j "$jobs"
+        logged install.log /usr/bin/make install
     )
     pkgconf_bin="$work_dir/tools/bin/pkgconf"
 else
@@ -78,7 +105,7 @@ fetch_and_verify \
 (
     cd "openconnect-${OPENCONNECT_VER}"
     # macOS added strchrnul in 15.4. Use OpenConnect's fallback for macOS 14.
-    env AR=/usr/bin/ar RANLIB=/usr/bin/ranlib PKG_CONFIG="$pkgconf_bin" \
+    logged configure.log env AR=/usr/bin/ar RANLIB=/usr/bin/ranlib PKG_CONFIG="$pkgconf_bin" \
         CC="/usr/bin/clang -arch $arch" \
         CFLAGS="-O2 -mmacosx-version-min=14.0" \
         ac_cv_func_strchrnul=no \
@@ -86,12 +113,11 @@ fetch_and_verify \
         OPENSSL_LIBS="-L$work_dir/ossl-static -lssl -lcrypto -lpthread" \
         LIBXML2_CFLAGS="-I$sdk/usr/include/libxml2" \
         LIBXML2_LIBS="-lxml2" \
-        ./configure --prefix="$work_dir/oc-install" --disable-shared --enable-static \
+        ./configure --disable-shared --enable-static \
         --without-gnutls --without-lz4 --without-libproxy --without-stoken --without-gssapi --without-libpcsclite \
-        --disable-nls --with-system-cafile=/etc/ssl/cert.pem --with-vpnc-script=/usr/bin/false > configure.log 2>&1
-    /usr/bin/make -j "$jobs" AR=/usr/bin/ar RANLIB=/usr/bin/ranlib openconnect > build.log 2>&1
-    /usr/bin/make install-sbinPROGRAMS > install.log 2>&1
-    cp "$work_dir/oc-install/sbin/openconnect" "$out_dir/bin/openconnect"
+        --disable-nls --with-system-cafile=/etc/ssl/cert.pem --with-vpnc-script=/usr/bin/false
+    logged build.log /usr/bin/make -j "$jobs" AR=/usr/bin/ar RANLIB=/usr/bin/ranlib openconnect
+    cp openconnect "$out_dir/bin/openconnect"
 )
 
 bin="$out_dir/bin/openconnect"
