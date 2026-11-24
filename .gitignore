@@ -1,0 +1,8 @@
+.DS_Store
+build/
+dist/
+*.log
+*.dSYM
+*.zip
+*.tar.gz
+*.tar.xz

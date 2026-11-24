@@ -1,0 +1,83 @@
+name: Build & Release UWVPN
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            os: macos-14
+          - arch: x86_64
+            os: macos-15-intel
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenSSL static libs via Homebrew
+        run: brew install openssl@3 pkgconf
+
+      - name: Build UWVPN.app (${{ matrix.arch }})
+        env:
+          OPENSSL_ROOT_DIR: ${{ matrix.arch == 'arm64' && '/opt/homebrew/opt/openssl@3' || '/usr/local/opt/openssl@3' }}
+        run: |
+          chmod +x scripts/build-helpers.sh scripts/build-app.sh
+          ./scripts/build-app.sh "${{ matrix.arch }}" "build/helpers-${{ matrix.arch }}" "dist/UWVPN-${{ matrix.arch }}/UWVPN.app"
+
+      - name: Verify tun-bridge.sh and app bundle
+        run: |
+          /bin/zsh -n src/UWVPN/tun-bridge.sh
+          codesign --verify --deep --strict "dist/UWVPN-${{ matrix.arch }}/UWVPN.app"
+          ditto -c -k --sequesterRsrc --keepParent "dist/UWVPN-${{ matrix.arch }}/UWVPN.app" "dist/UWVPN-macOS-${{ matrix.arch }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UWVPN-macOS-${{ matrix.arch }}
+          path: dist/UWVPN-macOS-${{ matrix.arch }}.zip
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: macos-14
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Combine Universal UWVPN.app
+        run: |
+          mkdir -p dist/universal
+          ditto -x -k artifacts/UWVPN-macOS-arm64/UWVPN-macOS-arm64.zip dist/arm64
+          ditto -x -k artifacts/UWVPN-macOS-x86_64/UWVPN-macOS-x86_64.zip dist/x86_64
+          cp -R dist/arm64/UWVPN.app dist/universal/UWVPN.app
+          for rel in Contents/MacOS/UWVPN Contents/Resources/bin/openconnect Contents/Resources/bin/ocproxy; do
+            lipo -create \
+              "dist/arm64/UWVPN.app/$rel" \
+              "dist/x86_64/UWVPN.app/$rel" \
+              -output "dist/universal/UWVPN.app/$rel"
+          done
+          codesign --force --deep --sign - dist/universal/UWVPN.app
+          codesign --verify --deep --strict dist/universal/UWVPN.app
+          ditto -c -k --sequesterRsrc --keepParent dist/universal/UWVPN.app dist/UWVPN-macOS-universal.zip
+          cp artifacts/UWVPN-macOS-arm64/UWVPN-macOS-arm64.zip dist/
+          cp artifacts/UWVPN-macOS-x86_64/UWVPN-macOS-x86_64.zip dist/
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/UWVPN-macOS-universal.zip
+            dist/UWVPN-macOS-arm64.zip
+            dist/UWVPN-macOS-x86_64.zip
