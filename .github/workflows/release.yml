@@ -52,6 +52,7 @@ jobs:
           path: |
             build/helpers-${{ matrix.arch }}/bin/openconnect
             build/helpers-${{ matrix.arch }}/licenses
+            build/helpers-${{ matrix.arch }}/fingerprint
           key: openconnect-${{ matrix.os }}-${{ steps.toolchain.outputs.version }}-${{ hashFiles('scripts/build-helpers.sh', 'src/UWVPN/Info.plist') }}
 
       - name: Build and sign app
@@ -59,12 +60,16 @@ jobs:
 
       - name: Test tunnel and validate app
         run: |
-          (cd src/tun-socks && CGO_ENABLED=0 go test -mod=readonly ./...)
+          (cd src/tun-socks && CGO_ENABLED=1 go test -mod=readonly -race ./...)
           /bin/zsh -n src/UWVPN/tun-bridge.sh
           dist/UWVPN.app/Contents/Resources/bin/openconnect --version
           for executable in Contents/MacOS/UWVPN Contents/Resources/bin/{openconnect,tun-socks}; do
             test "$(lipo -archs "dist/UWVPN.app/$executable")" = '${{ matrix.arch }}'
           done
+
+      - name: Test recovery when the SOCKS5 helper exits
+        if: matrix.arch == 'arm64'
+        run: /bin/zsh tests/tunnel-recovery.sh
 
       - name: Package app
         run: ditto -c -k --sequesterRsrc --keepParent dist/UWVPN.app 'dist/UWVPN-macOS-${{ matrix.arch }}.zip'

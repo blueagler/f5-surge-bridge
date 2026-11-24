@@ -57,6 +57,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 if self.lastPathSatisfied == nil {
                     self.lastPathSatisfied = online
+                    r.handleNetworkStatus(online: online)
+                    if self.configurationValid && r.autoConnectEnabled && r.inMemoryCachedSession() != nil {
+                        r.connect()
+                    }
                     return
                 }
                 self.lastPathSatisfied = online
@@ -70,9 +74,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         pathMonitor.start(queue: DispatchQueue.global(qos: .utility))
 
-        if configurationValid && r.autoConnectEnabled && r.inMemoryCachedSession() != nil {
-            r.connect()
-        }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

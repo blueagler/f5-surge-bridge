@@ -14,6 +14,15 @@ cleanup_tmp() {
 }
 trap cleanup_tmp EXIT
 
+ipv6_address="${INTERNAL_IP6_ADDRESS:-${INTERNAL_IP6_NETMASK:-}}"
+ipv6_address="${ipv6_address%%/*}"
+has_ipv6=false
+mtu="${INTERNAL_IP4_MTU:-0}"
+if [[ "$ipv6_address" == *:* && "$ipv6_address" == *[1-9a-fA-F]* && "$mtu" == <-> ]] &&
+   (( mtu == 0 || mtu >= 1280 )); then
+    has_ipv6=true
+fi
+
 print_cidrs() {
     local prefix="$1" rule_type="$2" count_var="${1}" i addr_var mask_var addr masklen
     local count="${(P)count_var:-0}"
@@ -38,14 +47,14 @@ if [[ -n "$rule_stem" ]]; then
             done
         fi
         print_cidrs CISCO_SPLIT_INC IP-CIDR
-        print_cidrs CISCO_IPV6_SPLIT_INC IP-CIDR6
+        if $has_ipv6; then print_cidrs CISCO_IPV6_SPLIT_INC IP-CIDR6; fi
     } > "$tmp_rules"
 
     tmp_exc=$(mktemp "$support_dir/${rule_stem}-exclude.XXXXXXXX")
     {
         print "# Derived from F5 BIG-IP split-exclude options on $(date '+%Y-%m-%d %H:%M:%S')"
         print_cidrs CISCO_SPLIT_EXC IP-CIDR
-        print_cidrs CISCO_IPV6_SPLIT_EXC IP-CIDR6
+        if $has_ipv6; then print_cidrs CISCO_IPV6_SPLIT_EXC IP-CIDR6; fi
     } > "$tmp_exc"
 
     mv "$tmp_exc" "$support_dir/${rule_stem}-exclude.list"

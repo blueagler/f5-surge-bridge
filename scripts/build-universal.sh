@@ -12,6 +12,17 @@ done
 
 universal="$work_dir/universal/UWVPN.app"
 ditto "$work_dir/arm64/UWVPN.app" "$universal"
+for license in "$work_dir/x86_64/UWVPN.app/Contents/Resources/Licenses/"**/*(.); do
+    intel_licenses="$work_dir/x86_64/UWVPN.app/Contents/Resources/Licenses/"
+    relative="${license#$intel_licenses}"
+    target="$universal/Contents/Resources/Licenses/$relative"
+    if [[ -f "$target" ]]; then
+        cmp -- "$license" "$target"
+    else
+        mkdir -p "${target:h}"
+        cp "$license" "$target"
+    fi
+done
 for executable in Contents/MacOS/UWVPN Contents/Resources/bin/{openconnect,tun-socks}; do
     lipo -create "$work_dir/arm64/UWVPN.app/$executable" "$work_dir/x86_64/UWVPN.app/$executable" \
         -output "$universal/$executable"

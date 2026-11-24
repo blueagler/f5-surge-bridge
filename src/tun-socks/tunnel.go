@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/buffer"
@@ -24,6 +26,7 @@ import (
 )
 
 const vpnNIC = 1
+const maxVPNDatagram = 2048 // Darwin's default AF_UNIX SOCK_DGRAM send capacity.
 
 type tunnel struct {
 	stack     *stack.Stack
@@ -32,7 +35,7 @@ type tunnel struct {
 	dns       []netip.Addr
 }
 
-func newTunnel() (*tunnel, error) {
+func newTunnel(datagramLimit int) (*tunnel, error) {
 	mtu := 1400
 	if raw := os.Getenv("INTERNAL_IP4_MTU"); raw != "" && raw != "0" {
 		value, err := strconv.Atoi(raw)
@@ -41,6 +44,7 @@ func newTunnel() (*tunnel, error) {
 		}
 		mtu = value
 	}
+	mtu = min(mtu, datagramLimit)
 	vpn := &tunnel{
 		stack: stack.New(stack.Options{
 			NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
@@ -70,6 +74,9 @@ func newTunnel() (*tunnel, error) {
 		// F5 can advertise a default IPv6 route (::/0) without assigning an address.
 		if addr.IsUnspecified() {
 			continue
+		}
+		if addr.Is6() && mtu < 1280 {
+			continue // IPv6 requires a link MTU of at least 1280 bytes.
 		}
 		address := tcpip.AddrFromSlice(addr.AsSlice())
 		protocol := networkProtocol(addr)
@@ -143,8 +150,10 @@ func (t *tunnel) transmit(ctx context.Context, conn net.Conn) error {
 		pkt.DecRef()
 		_, err := conn.Write(view.AsSlice())
 		view.Release()
-		if err != nil {
-			return err
+		// A full or undersized packet queue loses one IP datagram, not the tunnel.
+		if err != nil && !errors.Is(err, syscall.ENOBUFS) &&
+			!errors.Is(err, syscall.EMSGSIZE) && !errors.Is(err, syscall.EAGAIN) {
+			return fmt.Errorf("write VPNFD: %w", err)
 		}
 	}
 }

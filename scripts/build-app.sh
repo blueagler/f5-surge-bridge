@@ -17,7 +17,9 @@ if ! command -v go >/dev/null; then
     print -u2 "Go 1.27.3 or newer is required to build tun-socks."
     exit 1
 fi
-if [[ ! -x "$helpers_dir/bin/openconnect" || ! -f "$helpers_dir/licenses/OpenConnect.txt" || ! -f "$helpers_dir/licenses/OpenSSL.txt" ]]; then
+expected_fingerprint=$("$repo_root/scripts/build-helpers.sh" --fingerprint "$arch")
+if [[ ! -x "$helpers_dir/bin/openconnect" || ! -f "$helpers_dir/licenses/OpenConnect.txt" || ! -f "$helpers_dir/licenses/OpenSSL.txt" ||
+      ! -f "$helpers_dir/fingerprint" || "$(<"$helpers_dir/fingerprint")" != "$expected_fingerprint" ]]; then
     "$repo_root/scripts/build-helpers.sh" "$arch" "$helpers_dir"
 fi
 helpers_dir="${helpers_dir:A}"
@@ -41,13 +43,26 @@ cp "$helpers_dir/licenses/"{OpenConnect,OpenSSL}.txt "$licenses_dir/"
 cp "$repo_root/LICENSE" "$licenses_dir/UWVPN.txt"
 (
     cd "$repo_root/src/tun-socks"
-    cp "$(go env GOROOT)/"{LICENSE,PATENTS} "$licenses_dir/go/"
+    goroot=$(go env GOROOT)
+    cp "$goroot/LICENSE" "$licenses_dir/go/"
+    if [[ -f "$goroot/PATENTS" ]]; then cp "$goroot/PATENTS" "$licenses_dir/go/"; fi
     CGO_ENABLED=0 GOOS=darwin GOARCH="$go_arch" go list -mod=readonly -deps \
         -f '{{with .Module}}{{if not .Main}}{{.Path}} {{.Dir}}{{end}}{{end}}' . | sort -u |
         while read -r module module_dir; do
             [[ -n "$module_dir" ]] || continue
             mkdir -p "$licenses_dir/$module"
-            cp "$module_dir/LICENSE" "$licenses_dir/$module/"
+            license=""
+            for candidate in LICENSE LICENSE.md LICENSE.txt COPYING; do
+                if [[ -f "$module_dir/$candidate" ]]; then
+                    license="$candidate"
+                    break
+                fi
+            done
+            if [[ -z "$license" ]]; then
+                print -u2 "Missing license for $module"
+                exit 1
+            fi
+            cp "$module_dir/$license" "$licenses_dir/$module/"
             for notice in NOTICE PATENTS; do
                 if [[ -f "$module_dir/$notice" ]]; then
                     cp "$module_dir/$notice" "$licenses_dir/$module/"
@@ -67,6 +82,15 @@ for bin in "$app_out/Contents/MacOS/UWVPN" "$app_out/Contents/Resources/bin/"{op
     if otool -L "$bin" | tail -n +2 | grep -qvE '^[[:space:]]+(/usr/lib/|/System/)'; then
         print -u2 "ERROR: $bin has non-system library dependencies:"
         otool -L "$bin"
+        exit 1
+    fi
+    binary_minimum=$(xcrun vtool -show-build "$bin" | awk '/minos/ { print $2 }')
+    if ! awk -v actual="$binary_minimum" -v target="$min_macos" 'BEGIN {
+        if (actual !~ /^[0-9]+\.[0-9]+(\.[0-9]+)?$/) exit 1
+        split(actual, a, "."); split(target, t, ".")
+        for (i = 1; i <= 3; i++) if (a[i]+0 != t[i]+0) exit (a[i]+0 > t[i]+0)
+    }'; then
+        print -u2 "ERROR: $bin requires macOS $binary_minimum, bundle supports macOS $min_macos"
         exit 1
     fi
 done

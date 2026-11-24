@@ -13,11 +13,46 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 )
 
+func TestSOCKSGreetingAtFlowCapacity(t *testing.T) {
+	listener, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	client, err := net.DialTCP("tcp4", nil, listener.Addr().(*net.TCPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	conn, err := listener.AcceptTCP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	handshakes := make(chan struct{}, 1)
+	active := make(chan struct{}, 1)
+	handshakes <- struct{}{}
+	active <- struct{}{}
+	vpn := &tunnel{}
+	go vpn.handle(context.Background(), conn, handshakes, active)
+	client.SetDeadline(time.Now().Add(2 * time.Second))
+	client.Write([]byte{5, 1, 0})
+	var greeting [2]byte
+	if _, err := io.ReadFull(client, greeting[:]); err != nil || greeting != [2]byte{5, 0} {
+		t.Fatalf("greeting under load = %v, %v", greeting, err)
+	}
+	client.Write(addressMessage([]byte{5, connect, 0}, netip.MustParseAddrPort("10.0.0.1:443")))
+	var reply [10]byte
+	if _, err := io.ReadFull(client, reply[:]); err != nil || reply[1] != 1 {
+		t.Fatalf("request at capacity = %v, %v", reply, err)
+	}
+}
+
 func TestDefaultIPv6RouteWithoutAddress(t *testing.T) {
 	t.Setenv("INTERNAL_IP4_ADDRESS", "10.0.0.2")
 	t.Setenv("INTERNAL_IP6_ADDRESS", "::")
 	t.Setenv("INTERNAL_IP6_NETMASK", "::/0")
-	vpn, err := newTunnel()
+	vpn, err := newTunnel(maxVPNDatagram)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +70,7 @@ func TestSOCKSTunnel(t *testing.T) {
 	makeTunnel := func(v4, v6 string) *tunnel {
 		t.Setenv("INTERNAL_IP4_ADDRESS", v4)
 		t.Setenv("INTERNAL_IP6_ADDRESS", v6)
-		vpn, err := newTunnel()
+		vpn, err := newTunnel(maxVPNDatagram)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -136,23 +171,35 @@ func TestSOCKSTunnel(t *testing.T) {
 			defer server.Close()
 			go func() {
 				var packet [32]byte
-				if n, source, err := server.ReadFrom(packet[:]); err == nil {
+				for {
+					n, source, err := server.ReadFrom(packet[:])
+					if err != nil {
+						return
+					}
 					server.WriteTo(packet[:n], source)
 				}
 			}()
 			control, bound := openControl(t, udpAssociate, netip.AddrPortFrom(netip.IPv4Unspecified(), 0))
-			relay, err := net.DialUDP("udp4", nil, net.UDPAddrFromAddrPort(netip.AddrPortFrom(bound.ip, bound.port)))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer relay.Close()
-			relay.SetDeadline(time.Now().Add(5 * time.Second))
-			want := append(addressMessage([]byte{0, 0, 0}, endpoint), []byte("udp")...)
-			relay.Write(want)
-			var packet [64]byte
-			n, err := relay.Read(packet[:])
-			if err != nil || !bytes.Equal(packet[:n], want) {
-				t.Fatalf("echo: %x, %v; want %x", packet[:n], err, want)
+			relayAddr := net.UDPAddrFromAddrPort(netip.AddrPortFrom(bound.ip, bound.port))
+			for index := range 2 {
+				relay, err := net.DialUDP("udp4", nil, relayAddr)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer relay.Close()
+				relay.SetDeadline(time.Now().Add(time.Second))
+				if index == 0 {
+					// The fixture DNS drops this request, which must not stall other flows.
+					unresolved := append([]byte{0, 0, 0, addressName, 15}, "unknown.invalid"...)
+					relay.Write(binary.BigEndian.AppendUint16(unresolved, 53))
+				}
+				want := append(addressMessage([]byte{0, 0, 0}, endpoint), byte(index))
+				relay.Write(want)
+				var packet [64]byte
+				n, err := relay.Read(packet[:])
+				if err != nil || !bytes.Equal(packet[:n], want) {
+					t.Fatalf("echo: %x, %v; want %x", packet[:n], err, want)
+				}
 			}
 			control.Close()
 		})

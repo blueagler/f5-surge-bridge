@@ -97,6 +97,23 @@ final class GatewayRelay {
         let expiresAt: TimeInterval
     }
 
+    private final class DNSAnswers: @unchecked Sendable {
+        private let lock = NSLock()
+        private var addresses: [UInt8: [IPAddress]] = [:]
+
+        func store(_ result: [IPAddress], type: UInt8) {
+            lock.lock()
+            addresses[type] = result
+            lock.unlock()
+        }
+
+        var combined: [IPAddress] {
+            lock.lock()
+            defer { lock.unlock() }
+            return (addresses[1] ?? []) + (addresses[28] ?? [])
+        }
+    }
+
     private let lock = NSLock()
     private var listenFD: Int32 = -1
     private(set) var port: UInt16 = 0
@@ -560,9 +577,13 @@ final class GatewayRelay {
             }
         }
 
-        if let orderDict = SCDynamicStoreCopyValue(store, "Setup:/Network/Global/IPv4" as CFString) as? [String: Any],
-           let serviceOrder = orderDict["ServiceOrder"] as? [String] {
-            for serviceID in serviceOrder {
+        let serviceOrder = ["IPv4", "IPv6"].flatMap { family -> [String] in
+            let order = SCDynamicStoreCopyValue(store, "Setup:/Network/Global/\(family)" as CFString) as? [String: Any]
+            return order?["ServiceOrder"] as? [String] ?? []
+        }
+        var seenServices = Set<String>()
+        do {
+            for serviceID in serviceOrder where seenServices.insert(serviceID).inserted {
                 let ifName = ["IPv4", "IPv6"].compactMap { family -> String? in
                     let state = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(serviceID)/\(family)" as CFString) as? [String: Any]
                     return state?["InterfaceName"] as? String
@@ -633,7 +654,7 @@ final class GatewayRelay {
         lock.unlock()
 
         // Try physical-interface DHCP DNS first, then public DNS fallback on the bound physical NIC.
-        var servers = snapshot.dnsServers
+        var servers = Array(snapshot.dnsServers.prefix(3))
         for fallbackDNS in ["1.1.1.1", "2606:4700:4700::1111", "8.8.8.8"] where !servers.contains(fallbackDNS) {
             servers.append(fallbackDNS)
         }
@@ -642,9 +663,13 @@ final class GatewayRelay {
         for server in servers {
             let literal = server.split(separator: "%", maxSplits: 1).first.map(String.init) ?? ""
             guard let address = IPAddress(literal), address.isUsable else { continue }
-            for type: UInt8 in [1, 28] where Date() < lookupDeadline {
-                directAddrs += resolveViaDirectDNS(host: host, ifaceIndex: snapshot.ifaceIndex, server: address, type: type)
+            guard Date() < lookupDeadline else { break }
+            let answers = DNSAnswers()
+            DispatchQueue.concurrentPerform(iterations: 2) { index in
+                let type: UInt8 = index == 0 ? 1 : 28
+                answers.store(self.resolveViaDirectDNS(host: host, ifaceIndex: snapshot.ifaceIndex, server: address, type: type), type: type)
             }
+            directAddrs = answers.combined
             if !directAddrs.isEmpty || Date() >= lookupDeadline { break }
         }
         if !directAddrs.isEmpty {

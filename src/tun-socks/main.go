@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -10,10 +11,17 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func main() {
+	log.SetPrefix("tun-socks: ")
 	if err := run(); err != nil {
+		var code syscall.Errno
+		errors.As(err, &code)
+		// The macOS app records only this numeric diagnostic in its unified log.
+		fmt.Fprintf(os.Stderr, "tun-socks: fatal errno=%d\n", code)
 		log.Fatal(err)
 	}
 }
@@ -30,6 +38,10 @@ func run() error {
 	if err != nil || fd < 3 {
 		return fmt.Errorf("invalid OpenConnect VPNFD")
 	}
+	sendCapacity, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF)
+	if err != nil || sendCapacity < 576 {
+		return fmt.Errorf("invalid VPNFD send buffer: %d (%v)", sendCapacity, err)
+	}
 	file := os.NewFile(uintptr(fd), "VPNFD")
 	packetConn, err := net.FileConn(file)
 	file.Close()
@@ -37,11 +49,13 @@ func run() error {
 		return fmt.Errorf("open VPNFD: %w", err)
 	}
 	defer packetConn.Close()
-	if _, ok := packetConn.(*net.UnixConn); !ok || packetConn.LocalAddr().Network() != "unixgram" {
+	packetSocket, ok := packetConn.(*net.UnixConn)
+	if !ok || packetConn.LocalAddr().Network() != "unixgram" {
 		return fmt.Errorf("VPNFD is not a Unix datagram socket")
 	}
+	_ = packetSocket.SetReadBuffer(256 * 1024)
 
-	vpn, err := newTunnel()
+	vpn, err := newTunnel(min(sendCapacity, maxVPNDatagram))
 	if err != nil {
 		return err
 	}
@@ -59,7 +73,7 @@ func run() error {
 	go func() { errors <- vpn.serve(ctx, listener) }()
 	// OpenConnect normally signals the script's process group. Also release the
 	// listener if it is killed before it can send SIGHUP.
-	ticker := time.NewTicker(time.Second)
+	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	for os.Getppid() != 1 {
 		select {

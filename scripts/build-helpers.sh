@@ -2,6 +2,15 @@
 set -euo pipefail
 
 repo_root="${0:A:h:h}"
+if [[ "${1:-}" == --fingerprint ]]; then
+    {
+        /bin/cat "$repo_root/scripts/build-helpers.sh" "$repo_root/src/UWVPN/Info.plist"
+        print -r -- "${2:?missing architecture}"
+        xcodebuild -version
+        xcrun --show-sdk-version
+    } | /usr/bin/shasum -a 256 | /usr/bin/cut -d ' ' -f 1
+    exit
+fi
 arch="${1:-$(uname -m)}"
 out_dir="${2:-$repo_root/build/helpers-$arch}"
 out_dir="${out_dir:A}"
@@ -17,6 +26,8 @@ PKGCONF_VER="3.0.11"
 PKGCONF_SHA256="d0cd841bc8e55b9da888106c00dc256d05b7d1d8e5a46f4be4eb4c5125bd2dc4"
 
 sdk=$(xcrun --show-sdk-path)
+unset CPPFLAGS LDFLAGS CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH OBJC_INCLUDE_PATH LIBRARY_PATH MACOSX_DEPLOYMENT_TARGET
+export SDKROOT="$sdk"
 min_macos=$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$repo_root/src/UWVPN/Info.plist")
 jobs=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
@@ -52,8 +63,8 @@ fetch_and_verify \
 /usr/bin/tar -xzf "openssl-${OPENSSL_VER}.tar.gz" -C "$source_dir"
 (
     cd "$openssl_dir"
-    logged configure.log /usr/bin/perl Configure "$openssl_target" no-shared no-tests no-apps \
-        "-mmacosx-version-min=$min_macos"
+    logged configure.log env CC=/usr/bin/clang /usr/bin/perl Configure "$openssl_target" no-shared no-tests no-apps \
+        "-mmacosx-version-min=$min_macos" "-isysroot$sdk"
     logged build.log /usr/bin/make -j "$jobs" AR=/usr/bin/ar 'RANLIB=/usr/bin/ranlib -c' build_libs
 )
 
@@ -81,18 +92,25 @@ fetch_and_verify \
 /usr/bin/tar -xzf "openconnect-${OPENCONNECT_VER}.tar.gz" -C "$source_dir"
 (
     cd "$source_dir/openconnect-${OPENCONNECT_VER}"
+    configure_arch=()
+    if [[ "$arch" != "$(uname -m)" ]]; then
+        build_triplet=$(/bin/sh ./config.guess)
+        host_cpu="$arch"
+        if [[ "$arch" == arm64 ]]; then host_cpu=aarch64; fi
+        configure_arch=("--build=$build_triplet" "--host=$host_cpu-apple-darwin")
+    fi
     # Keep runner-installed packages out of the app's runtime dependencies.
     logged configure.log env AR=/usr/bin/ar RANLIB=/usr/bin/ranlib PKG_CONFIG="$pkgconf_bin" \
         PKG_CONFIG_PATH= PKG_CONFIG_LIBDIR="$work_dir/empty-pkgconfig" \
         CC="/usr/bin/clang -arch $arch" \
-        CFLAGS="-O2 -mmacosx-version-min=$min_macos" \
+        CFLAGS="-O2 -mmacosx-version-min=$min_macos -isysroot $sdk" \
         OPENSSL_CFLAGS="-I$openssl_dir/include" \
         OPENSSL_LIBS="-L$openssl_dir -lssl -lcrypto -lpthread" \
         LIBXML2_CFLAGS="-I$sdk/usr/include/libxml2" \
         LIBXML2_LIBS="-lxml2" \
         ZLIB_CFLAGS="-I$sdk/usr/include" \
         ZLIB_LIBS="-lz" \
-        ./configure --disable-shared --enable-static \
+        ./configure "${configure_arch[@]}" --disable-shared --enable-static \
         --without-gnutls --without-lz4 --without-libproxy --without-stoken --without-gssapi --without-libpcsclite \
         --disable-nls --with-system-cafile=/etc/ssl/cert.pem --with-vpnc-script=/usr/bin/false
     logged build.log /usr/bin/make -j "$jobs" AR=/usr/bin/ar RANLIB=/usr/bin/ranlib openconnect
@@ -111,3 +129,4 @@ if otool -L "$bin" | tail -n +2 | grep -qvE '^[[:space:]]+(/usr/lib/|/System/)';
 fi
 cp "$source_dir/openconnect-${OPENCONNECT_VER}/COPYING.LGPL" "$out_dir/licenses/OpenConnect.txt"
 cp "$openssl_dir/LICENSE.txt" "$out_dir/licenses/OpenSSL.txt"
+"$repo_root/scripts/build-helpers.sh" --fingerprint "$arch" > "$out_dir/fingerprint"

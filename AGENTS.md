@@ -20,6 +20,7 @@
 
 ```sh
 (cd src/tun-socks && CGO_ENABLED=0 go test -mod=readonly ./...)
+/bin/zsh tests/tunnel-recovery.sh
 /bin/zsh -n src/UWVPN/tun-bridge.sh
 ./scripts/build-app.sh
 codesign --verify --deep --strict dist/UWVPN.app
