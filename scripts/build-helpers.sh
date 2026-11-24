@@ -7,12 +7,10 @@ out_dir="${2:-$repo_root/build/helpers-$arch}"
 out_dir="${out_dir:A}"
 work_dir="${repo_root}/build/src-$arch"
 
-mkdir -p "$out_dir/bin" "$work_dir/tools/bin" "$work_dir/ossl-static"
+mkdir -p "$out_dir/bin" "$work_dir/ossl-static"
 
 OPENCONNECT_VER="9.21"
 OPENCONNECT_SHA256="5b32369467db6e5f317aa1ed12cfcbb81ed00bdbc765450b6bfcbdc300944a58"
-PKGCONF_VER="3.0.11"
-PKGCONF_SHA256="d0cd841bc8e55b9da888106c00dc256d05b7d1d8e5a46f4be4eb4c5125bd2dc4"
 OPENSSL_VER="3.5.9"
 OPENSSL_SHA256="603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a"
 
@@ -77,26 +75,7 @@ fi
 ln -sf "$openssl_dir/lib/libssl.a" "$work_dir/ossl-static/libssl.a"
 ln -sf "$openssl_dir/lib/libcrypto.a" "$work_dir/ossl-static/libcrypto.a"
 
-# 1. Build pkgconf if not present
-if ! command -v pkgconf >/dev/null 2>&1 && ! command -v pkg-config >/dev/null 2>&1; then
-    fetch_and_verify \
-        "https://distfiles.ariadne.space/pkgconf/pkgconf-${PKGCONF_VER}.tar.xz" \
-        "pkgconf-${PKGCONF_VER}.tar.xz" \
-        "$PKGCONF_SHA256"
-    /usr/bin/tar -xf "pkgconf-${PKGCONF_VER}.tar.xz"
-    (
-        cd "pkgconf-${PKGCONF_VER}"
-        logged configure.log env CC="/usr/bin/clang -arch $arch" CFLAGS="-O2 -mmacosx-version-min=14.0" \
-            ./configure --prefix="$work_dir/tools"
-        logged build.log /usr/bin/make -j "$jobs"
-        logged install.log /usr/bin/make install
-    )
-    pkgconf_bin="$work_dir/tools/bin/pkgconf"
-else
-    pkgconf_bin=$(command -v pkgconf || command -v pkg-config)
-fi
-
-# 2. Build portable openconnect (static OpenSSL + Apple system libxml2/zlib/iconv)
+# Build portable OpenConnect using static OpenSSL and macOS SDK libraries.
 fetch_and_verify \
     "https://www.infradead.org/openconnect/download/openconnect-${OPENCONNECT_VER}.tar.gz" \
     "openconnect-${OPENCONNECT_VER}.tar.gz" \
@@ -104,8 +83,8 @@ fetch_and_verify \
 /usr/bin/tar -xzf "openconnect-${OPENCONNECT_VER}.tar.gz"
 (
     cd "openconnect-${OPENCONNECT_VER}"
-    # macOS added strchrnul in 15.4. Use OpenConnect's fallback for macOS 14.
-    logged configure.log env AR=/usr/bin/ar RANLIB=/usr/bin/ranlib PKG_CONFIG="$pkgconf_bin" \
+    # Disable host pkg-config discovery and use the strchrnul fallback for macOS 14.
+    logged configure.log env AR=/usr/bin/ar RANLIB=/usr/bin/ranlib PKG_CONFIG=/usr/bin/false \
         CC="/usr/bin/clang -arch $arch" \
         CFLAGS="-O2 -mmacosx-version-min=14.0" \
         ac_cv_func_strchrnul=no \
@@ -113,6 +92,8 @@ fetch_and_verify \
         OPENSSL_LIBS="-L$work_dir/ossl-static -lssl -lcrypto -lpthread" \
         LIBXML2_CFLAGS="-I$sdk/usr/include/libxml2" \
         LIBXML2_LIBS="-lxml2" \
+        ZLIB_CFLAGS="-I$sdk/usr/include" \
+        ZLIB_LIBS="-lz" \
         ./configure --disable-shared --enable-static \
         --without-gnutls --without-lz4 --without-libproxy --without-stoken --without-gssapi --without-libpcsclite \
         --disable-nls --with-system-cafile=/etc/ssl/cert.pem --with-vpnc-script=/usr/bin/false
