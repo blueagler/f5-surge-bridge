@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 struct UWGateway: Codable, Hashable {
@@ -6,6 +7,7 @@ struct UWGateway: Codable, Hashable {
     let name: String
     let gatewayURL: URL
     let splitRules: Bool?
+    var fallbackDNSServers: [String]? = nil
 
     static let allInternet = UWGateway(id: "all", name: "All Internet", gatewayURL: URL(string: "https://huskyonnet-ns.uw.edu/")!, splitRules: false)
     static let campusOnly = UWGateway(id: "campus", name: "Campus Only", gatewayURL: URL(string: "https://huskyonnet.uw.edu/")!, splitRules: true)
@@ -14,6 +16,9 @@ struct UWGateway: Codable, Hashable {
     var shortLabel: String { name }
     var publishesSplitRules: Bool { splitRules == true }
     var isUWPreset: Bool { [Self.allInternet.gatewayHost, Self.campusOnly.gatewayHost].contains(gatewayHost) }
+    var gatewayDNSFallback: [String] {
+        fallbackDNSServers ?? (isUWPreset ? ["1.1.1.1", "2606:4700:4700::1111", "8.8.8.8"] : [])
+    }
     var ruleFileStem: String { "uw-\(webStoreUUID.uuidString.lowercased())" }
 
     var gatewayHost: String {
@@ -60,6 +65,7 @@ struct GatewayConfiguration: Codable {
 
     private func validated() throws -> Self {
         var ids = Set<String>()
+        var dnsPolicies: [String: [String]] = [:]
         for gateway in gateways {
             let url = gateway.gatewayURL
             guard gateway.id.range(of: "^[a-zA-Z0-9_-]{1,48}$", options: .regularExpression) != nil,
@@ -71,6 +77,15 @@ struct GatewayConfiguration: Codable {
                   url.path.isEmpty || url.path == "/",
                   let host = url.host, Self.isHostname(host) else {
                 throw ConfigurationError("Invalid gateway \(gateway.id). Use a unique ID, a display name, and a root HTTPS URL on port 443.")
+            }
+            let servers = gateway.gatewayDNSFallback
+            guard servers.allSatisfy({ text in
+                var ipv4 = in_addr()
+                var ipv6 = in6_addr()
+                return !text.utf8.contains(0) && (inet_pton(AF_INET, text, &ipv4) == 1 || inet_pton(AF_INET6, text, &ipv6) == 1)
+            }) else { throw ConfigurationError("fallbackDNSServers must contain IP addresses.") }
+            if let existing = dnsPolicies.updateValue(servers, forKey: gateway.gatewayHost), existing != servers {
+                throw ConfigurationError("Gateways on the same host must use the same fallbackDNSServers.")
             }
         }
         guard ids.contains(defaultGateway) else { throw ConfigurationError("defaultGateway must match a gateway ID.") }

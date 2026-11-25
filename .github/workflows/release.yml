@@ -67,6 +67,10 @@ jobs:
             test "$(lipo -archs "dist/UWVPN.app/$executable")" = '${{ matrix.arch }}'
           done
 
+      - name: Test gateway relay recovery and DNS configuration
+        if: matrix.arch == 'arm64'
+        run: /bin/zsh tests/gateway-relay.sh
+
       - name: Test recovery when the SOCKS5 helper exits
         if: matrix.arch == 'arm64'
         run: /bin/zsh tests/tunnel-recovery.sh

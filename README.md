@@ -32,6 +32,8 @@ Choose **Gateway → Edit Gateway Configuration** to open `~/Library/Application
 
 At most one gateway can publish split rules. `directHosts` optionally adds Surge exemptions for sign-in domains. Relaunch UWVPN and run **Install / Update Surge Module** after changing the configuration. Supported F5 sign-in flows issue both `MRHSession` and `F5_ST` cookies.
 
+The gateway relay resolves the VPN host using the physical interface's DNS servers. A gateway can list additional resolver IP addresses in `fallbackDNSServers`. The UW presets default to public fallback servers. Custom gateways default to an empty list. An explicit empty list disables those extra lookups. The relay also consults the macOS resolver if the direct lookups return no usable address. Traffic inside the VPN uses the DNS servers assigned by F5.
+
 ## Build and test
 
 Use macOS 26 or later, Xcode Command Line Tools, and Go 1.27.3 or newer. The script builds pinned OpenConnect and OpenSSL sources and writes the signed app to `dist/UWVPN.app`. It also reuses a previously built OpenConnect binary in `build/helpers-<arch>/bin/`.

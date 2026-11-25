@@ -1,9 +1,12 @@
 import Darwin
 import Foundation
+import OSLog
 import SystemConfiguration
 
 final class GatewayRelay {
-    private let allowedHosts: Set<String>
+    private static let logger = Logger(subsystem: "com.blueagle.uwvpn", category: "GatewayRelay")
+    private let gatewayDNS: [String: [String]]
+    private let acceptClient: (Int32) -> Int32
     private let maxHeaderBytes = 8192
     private let maxConcurrentTunnels = 64
     private let ioBufferBytes = 16384
@@ -12,8 +15,9 @@ final class GatewayRelay {
     private let dnsCacheTTL: TimeInterval = 60.0
     private let pathCacheTTL: TimeInterval = 15.0
 
-    init(gateways: [UWGateway]) {
-        allowedHosts = Set(gateways.map(\.gatewayHost))
+    init(gateways: [UWGateway], acceptClient: @escaping (Int32) -> Int32 = { Darwin.accept($0, nil, nil) }) {
+        gatewayDNS = Dictionary(gateways.map { ($0.gatewayHost, $0.gatewayDNSFallback) }, uniquingKeysWith: { first, _ in first })
+        self.acceptClient = acceptClient
     }
 
     private enum IPAddress {
@@ -115,7 +119,9 @@ final class GatewayRelay {
     }
 
     private let lock = NSLock()
-    private var listenFD: Int32 = -1
+    private let listenerQueue = DispatchQueue(label: "com.blueagle.uwvpn.relay.listener")
+    private var listener: DispatchSourceRead?
+    private var listenerGeneration: UInt64 = 0
     private(set) var port: UInt16 = 0
     private var running = false
     private var activeFDs: Set<Int32> = []
@@ -125,13 +131,16 @@ final class GatewayRelay {
     private let workerQueue = DispatchQueue(label: "com.blueagle.uwvpn.relay.workers", attributes: .concurrent)
 
     func start() throws {
-        lock.lock()
-        if running {
+        try listenerQueue.sync {
+            guard !isRunning() else { return }
+            try openListener(port: 0)
+            lock.lock()
+            running = true
             lock.unlock()
-            return
         }
-        lock.unlock()
+    }
 
+    private func openListener(port requestedPort: UInt16) throws {
         let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
         configureSocketFlags(fd)
@@ -142,7 +151,7 @@ final class GatewayRelay {
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = 0
+        addr.sin_port = requestedPort.bigEndian
         addr.sin_addr = in_addr(s_addr: inet_addr(UWConfig.loopbackHost))
 
         let bindRes = withUnsafePointer(to: &addr) {
@@ -175,30 +184,24 @@ final class GatewayRelay {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(err))
         }
 
-        lock.lock()
-        port = UInt16(bigEndian: bound.sin_port)
-        listenFD = fd
-        running = true
-        lock.unlock()
-
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.acceptLoop()
-        }
+        setNonBlocking(fd, enabled: true)
+        if requestedPort == 0 { port = UInt16(bigEndian: bound.sin_port) }
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: listenerQueue)
+        source.setEventHandler { [weak self] in self?.acceptNext(fd) }
+        source.setCancelHandler { Darwin.close(fd) }
+        listener = source
+        source.activate()
     }
 
     func stop() {
-        lock.lock()
-        running = false
-        let lfd = listenFD
-        listenFD = -1
-        let fds = activeFDs
-        activeFDs.removeAll()
-        lock.unlock()
-
-        if lfd >= 0 { Darwin.close(lfd) }
-        for fd in fds {
-            Darwin.shutdown(fd, SHUT_RDWR)
-            Darwin.close(fd)
+        listenerQueue.sync {
+            listenerGeneration &+= 1
+            listener?.cancel()
+            listener = nil
+            lock.lock()
+            running = false
+            for fd in activeFDs { Darwin.shutdown(fd, SHUT_RDWR) }
+            lock.unlock()
         }
     }
 
@@ -220,10 +223,15 @@ final class GatewayRelay {
         return r
     }
 
-    private func registerFD(_ fd: Int32) {
+    private func trackConnectedFD(_ fd: Int32) -> Int32? {
         lock.lock()
+        defer { lock.unlock() }
+        guard running else {
+            Darwin.close(fd)
+            return nil
+        }
         activeFDs.insert(fd)
-        lock.unlock()
+        return fd
     }
 
     private func closeTrackedFD(_ fd: Int32) {
@@ -235,45 +243,46 @@ final class GatewayRelay {
         }
     }
 
-    private func acceptLoop() {
-        while true {
-            lock.lock()
-            let shouldContinue = running
-            let fd = listenFD
-            lock.unlock()
-            guard shouldContinue, fd >= 0 else { break }
-
-            var clientAddr = sockaddr_storage()
-            var addrLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
-            let clientFD = withUnsafeMutablePointer(to: &clientAddr) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    Darwin.accept(fd, $0, &addrLen)
-                }
+    private func acceptNext(_ fd: Int32) {
+        guard let source = listener, source.handle == fd else { return }
+        let clientFD = acceptClient(fd)
+        if clientFD < 0 {
+            let failure = errno
+            switch failure {
+            case EAGAIN, EINTR, ECONNABORTED: break
+            case EMFILE, ENFILE, ENOBUFS, ENOMEM:
+                source.suspend()
+                listenerQueue.asyncAfter(deadline: .now() + 0.25) { source.resume() }
+            default:
+                Self.logger.error("Reopening gateway listener after accept errno \(failure, privacy: .public)")
+                source.cancel()
+                listener = nil
+                scheduleListenerRecovery(generation: listenerGeneration)
             }
-            if clientFD < 0 {
-                if errno == EINTR { continue }
-                break
-            }
+            return
+        }
+        configureSocketFlags(clientFD)
+        setNonBlocking(clientFD, enabled: false)
+        lock.lock()
+        let admitted = activeTunnelCount < maxConcurrentTunnels
+        if admitted {
+            activeTunnelCount += 1
+            activeFDs.insert(clientFD)
+        }
+        lock.unlock()
+        guard admitted else {
+            sendAll(clientFD, Data("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n".utf8))
+            Darwin.close(clientFD)
+            return
+        }
+        workerQueue.async { self.handleClient(clientFD) }
+    }
 
-            configureSocketFlags(clientFD)
-
-            lock.lock()
-            let canAccept = running && activeTunnelCount < maxConcurrentTunnels
-            if canAccept {
-                activeTunnelCount += 1
-                activeFDs.insert(clientFD)
-            }
-            lock.unlock()
-
-            if !canAccept {
-                sendAll(clientFD, Data("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n".utf8))
-                Darwin.close(clientFD)
-                continue
-            }
-
-            workerQueue.async { [weak self] in
-                self?.handleClient(clientFD)
-            }
+    private func scheduleListenerRecovery(generation: UInt64) {
+        listenerQueue.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self, self.listenerGeneration == generation, self.isRunning() else { return }
+            do { try self.openListener(port: self.port) }
+            catch { self.scheduleListenerRecovery(generation: generation) }
         }
     }
 
@@ -336,7 +345,7 @@ final class GatewayRelay {
         let suffix = ":\(UWConfig.httpsPort)"
         let host = authority.dropLast(suffix.count).lowercased()
         guard authority.hasSuffix(suffix),
-              allowedHosts.contains(host) else {
+              let fallbackServers = gatewayDNS[host] else {
             sendAll(clientFD, Data("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n".utf8))
             return
         }
@@ -346,7 +355,7 @@ final class GatewayRelay {
             return
         }
 
-        let candidates = resolveGateway(host: host, snapshot: snapshot, deadline: deadline)
+        let candidates = resolveGateway(host: host, snapshot: snapshot, fallbackServers: fallbackServers, deadline: deadline)
         guard !candidates.isEmpty else {
             sendAll(clientFD, Data("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n".utf8))
             return
@@ -426,8 +435,7 @@ final class GatewayRelay {
             let res = addr.connect(fd, port: UWConfig.httpsPort, ifaceIndex: ifaceIndex)
             if res == 0 {
                 setNonBlocking(fd, enabled: false)
-                registerFD(fd)
-                return fd
+                return trackConnectedFD(fd)
             }
             if errno != EINPROGRESS {
                 Darwin.close(fd)
@@ -456,8 +464,7 @@ final class GatewayRelay {
 
             if connected {
                 setNonBlocking(fd, enabled: false)
-                registerFD(fd)
-                return fd
+                return trackConnectedFD(fd)
             }
             Darwin.close(fd)
         }
@@ -641,7 +648,7 @@ final class GatewayRelay {
         return nil
     }
 
-    private func resolveGateway(host: String, snapshot: NetworkSnapshot, deadline: Date) -> [IPAddress] {
+    private func resolveGateway(host: String, snapshot: NetworkSnapshot, fallbackServers: [String], deadline: Date) -> [IPAddress] {
         if let address = IPAddress(host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))) {
             return address.isUsable ? [address] : []
         }
@@ -653,9 +660,8 @@ final class GatewayRelay {
         }
         lock.unlock()
 
-        // Try physical-interface DHCP DNS first, then public DNS fallback on the bound physical NIC.
         var servers = Array(snapshot.dnsServers.prefix(3))
-        for fallbackDNS in ["1.1.1.1", "2606:4700:4700::1111", "8.8.8.8"] where !servers.contains(fallbackDNS) {
+        for fallbackDNS in fallbackServers where !servers.contains(fallbackDNS) {
             servers.append(fallbackDNS)
         }
         var directAddrs: [IPAddress] = []
