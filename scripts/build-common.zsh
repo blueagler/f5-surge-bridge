@@ -6,7 +6,7 @@ uwvpn_repo_root="${uwvpn_repo_root:A:h:h}"
 uwvpn_mode="${UWVPN_BUILD_MODE:-adhoc}"
 uwvpn_revision="${UWVPN_COMMIT:-$(git -C "$uwvpn_repo_root" rev-parse HEAD)}"
 uwvpn_sign_identity="-"
-uwvpn_build_number="0"
+uwvpn_build_number=$(git -C "$uwvpn_repo_root" rev-list --count HEAD)
 
 if [[ ! "$uwvpn_revision" =~ '^[0-9a-f]{40}$' ]]; then
     print -u2 "UWVPN_COMMIT must be a full lowercase Git revision."
@@ -18,13 +18,14 @@ if [[ "$uwvpn_mode" != adhoc && "$uwvpn_mode" != release ]]; then
 fi
 uwvpn_base_version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
     "$uwvpn_repo_root/src/UWVPN/Info.plist")
-uwvpn_version="$uwvpn_base_version-adhoc+${uwvpn_revision[1,12]}"
+uwvpn_version="$uwvpn_base_version"
+uwvpn_dirty=false
 if [[ -n "$(git -C "$uwvpn_repo_root" status --porcelain)" ]]; then
     if [[ "$uwvpn_mode" == release ]]; then
         print -u2 "Public releases require a clean checkout."
         exit 1
     fi
-    uwvpn_version+=".dirty"
+    uwvpn_dirty=true
 fi
 if [[ "$uwvpn_mode" == release ]]; then
     uwvpn_tag="${UWVPN_RELEASE_TAG:?Public releases require UWVPN_RELEASE_TAG.}"
@@ -55,13 +56,14 @@ uwvpn_write_metadata() {
     /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $uwvpn_version" "$plist"
     /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $uwvpn_build_number" "$plist"
     /usr/libexec/PlistBuddy -c "Add :UWVPNSourceRevision string $uwvpn_revision" "$plist"
-    /usr/libexec/PlistBuddy -c "Add :UWVPDistribution string $uwvpn_mode" "$plist"
+    /usr/libexec/PlistBuddy -c "Add :UWVPNDistribution string $uwvpn_mode" "$plist"
+    /usr/libexec/PlistBuddy -c "Add :UWVPNSourceDirty bool $uwvpn_dirty" "$plist"
 }
 
 uwvpn_verify_identity() {
     local app="$1"
     if [[ "$(/usr/libexec/PlistBuddy -c 'Print :UWVPNSourceRevision' "$app/Contents/Info.plist" 2>/dev/null)" != "$uwvpn_revision" || \
-          "$(/usr/libexec/PlistBuddy -c 'Print :UWVPDistribution' "$app/Contents/Info.plist" 2>/dev/null)" != "$uwvpn_mode" ]]; then
+          "$(/usr/libexec/PlistBuddy -c 'Print :UWVPNDistribution' "$app/Contents/Info.plist" 2>/dev/null)" != "$uwvpn_mode" ]]; then
         print -u2 "The app build identity does not match this build."
         exit 1
     fi

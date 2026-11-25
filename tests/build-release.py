@@ -103,7 +103,7 @@ else:
 ''')
 
     def run_script(self, script, *args, env=None, expect=0):
-        environment = os.environ.copy()
+        environment = {key: value for key, value in os.environ.items() if not key.startswith("UWVPN_")}
         environment.update({
             "PATH": str(self.bin) + ":/usr/bin:/bin:/usr/sbin:/sbin",
             "TOOL_LOG": str(self.log),
@@ -152,8 +152,9 @@ else:
         output = self.build_arch("arm64")
         info = plistlib.loads((output / "UWVPN.app" / "Contents" / "Info.plist").read_bytes())
         self.assertEqual(info["UWVPNSourceRevision"], self.revision)
-        self.assertEqual(info["UWVPDistribution"], "adhoc")
-        self.assertIn("-adhoc+", info["CFBundleShortVersionString"])
+        self.assertEqual(info["UWVPNDistribution"], "adhoc")
+        self.assertFalse(info["UWVPNSourceDirty"])
+        self.assertRegex(info["CFBundleShortVersionString"], r"^\d+\.\d+\.\d+$")
         self.assertIn("BuildFixture.swift", (output / "UWVPN.app" / "Contents" / "MacOS" / "UWVPN").read_text())
         commands = self.log.read_text()
         self.assertIn("codesign --force --deep --sign - --timestamp=none", commands)
@@ -188,13 +189,12 @@ else:
             self.assertEqual(info["CFBundleShortVersionString"], "1.2.3")
             self.assertEqual(info["CFBundleVersion"], "42")
             self.assertEqual(info["UWVPNSourceRevision"], self.revision)
-            self.assertEqual(info["UWVPDistribution"], "release")
+            self.assertEqual(info["UWVPNDistribution"], "release")
         commands = self.log.read_text()
         self.assertEqual(commands.count("notarytool submit"), 3)
         self.assertEqual(commands.count("spctl --assess"), 6)
         self.assertNotIn("--sign -", commands)
         self.assertIn("--options runtime", commands)
-        self.assertGreaterEqual(commands.count("packaged-tunnel"), 3)
 
     def test_universal_rejects_mixed_build_identities(self):
         subprocess.run(["git", "tag", "v1.2.3"], cwd=self.repo, check=True)

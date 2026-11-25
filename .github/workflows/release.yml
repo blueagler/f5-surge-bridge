@@ -78,7 +78,6 @@ jobs:
           python3 tests/build-release.py
           (cd src/tun-socks && CGO_ENABLED=1 go test -mod=readonly -race ./...)
           /bin/zsh -n src/UWVPN/tun-bridge.sh
-          python3 tests/packaged-tunnel.py dist/UWVPN.app
           dist/UWVPN.app/Contents/Resources/bin/openconnect --version
           for executable in Contents/MacOS/UWVPN Contents/Resources/bin/{openconnect,tun-socks}; do
             test "$(lipo -archs "dist/UWVPN.app/$executable")" = '${{ matrix.arch }}'
@@ -93,7 +92,12 @@ jobs:
         run: /bin/zsh tests/tunnel-recovery.sh
 
       - name: Package app
-        run: ditto -c -k --sequesterRsrc --keepParent dist/UWVPN.app 'dist/UWVPN-macOS-${{ matrix.arch }}.zip'
+        run: |
+          archive='dist/UWVPN-macOS-${{ matrix.arch }}.zip'
+          ditto -c -k --sequesterRsrc --keepParent dist/UWVPN.app "$archive"
+          ditto -x -k "$archive" "$RUNNER_TEMP/arch-check"
+          codesign --verify --deep --strict "$RUNNER_TEMP/arch-check/UWVPN.app"
+          python3 tests/packaged-tunnel.py "$RUNNER_TEMP/arch-check/UWVPN.app"
 
       - uses: actions/upload-artifact@v7
         with:

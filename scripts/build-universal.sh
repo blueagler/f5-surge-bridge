@@ -10,7 +10,7 @@ for arch in arm64 x86_64; do
     ditto -x -k "$archive_dir/UWVPN-macOS-$arch.zip" "$work_dir/$arch"
     codesign --verify --deep --strict "$work_dir/$arch/UWVPN.app"
 done
-for key in CFBundleShortVersionString CFBundleVersion UWVPNSourceRevision UWVPDistribution; do
+for key in CFBundleShortVersionString CFBundleVersion UWVPNSourceRevision UWVPNSourceDirty UWVPNDistribution; do
     left=$(/usr/libexec/PlistBuddy -c "Print :$key" "$work_dir/arm64/UWVPN.app/Contents/Info.plist" 2>/dev/null) || {
         print -u2 "The arm64 archive is missing $key."
         exit 1

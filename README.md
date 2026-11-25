@@ -38,7 +38,7 @@ The gateway relay resolves the VPN host using the physical interface's DNS serve
 
 Use macOS 26 or later, Xcode, and Go 1.27.3 or newer. The script builds pinned OpenConnect and OpenSSL sources and writes the app to `dist/UWVPN.app`. It reuses a previously built OpenConnect binary in `build/helpers-<arch>/bin/` when the toolchain fingerprint matches.
 
-Personal builds use ad-hoc signing. Their versions contain `adhoc`, the short source revision, and `dirty` when the checkout has changes. `Info.plist` records the full source revision and distribution mode. Ad-hoc archives are for local use and are never published by the workflow.
+Personal builds use ad-hoc signing. `Info.plist` records the full Git revision, whether the checkout had local changes, and the distribution mode. Use these builds locally. GitHub Releases publishes Developer ID builds.
 
 ```sh
 ./scripts/build-app.sh

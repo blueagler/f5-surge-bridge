@@ -31,7 +31,6 @@ for arch in arm64 x86_64 universal; do
     xcrun stapler staple "$app"
     xcrun stapler validate "$app"
     spctl --assess --type execute --verbose=4 "$app"
-    python3 "$uwvpn_repo_root/tests/packaged-tunnel.py" "$app"
     ditto -c -k --sequesterRsrc --keepParent "$app" "$archive.new"
     rm -rf "$app_dir"
     mv -f "$archive.new" "$archive"
@@ -40,7 +39,6 @@ for arch in arm64 x86_64 universal; do
     xcrun stapler validate "$final_dir/UWVPN.app"
     spctl --assess --type execute --verbose=4 "$final_dir/UWVPN.app"
     codesign --verify --deep --strict "$final_dir/UWVPN.app"
-    python3 "$uwvpn_repo_root/tests/packaged-tunnel.py" "$final_dir/UWVPN.app"
     rm -rf "$final_dir"
     print "Notarized and stapled $archive"
 done
