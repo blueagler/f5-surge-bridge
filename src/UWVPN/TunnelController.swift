@@ -14,8 +14,12 @@ final class TunnelRunner {
 
     private let relay: GatewayRelay
     private let configuration: GatewayConfiguration
-    private let socksPort: UInt16
+    private let socksPortOverride: UInt16?
     private let onStateChange: () -> Void
+
+    var socksPort: UInt16 {
+        socksPortOverride ?? configuration.routes[selectedGateway.id]!.socksPort
+    }
 
     private(set) var state: TunnelState = .disconnected {
         didSet { onStateChange() }
@@ -46,8 +50,12 @@ final class TunnelRunner {
     private var networkOnline = true
     private var lastPhysicalInterface: String?
     private var reconnectAttempts = 0
-    private var lastSplitHash: String?
-    private var surgeReloadInFlight = false
+    private let surgeReload = SurgeReloadCoordinator { completion in
+        DispatchQueue.global(qos: .utility).async {
+            let succeeded = (try? SurgeModule.command(["reload"])) != nil
+            completion(succeeded)
+        }
+    }
     private var urlSession: URLSession?
 
     private let selectedGatewayKey = "selectedGateway"
@@ -83,11 +91,11 @@ final class TunnelRunner {
         }
     }
 
-    init(relay: GatewayRelay, configuration: GatewayConfiguration, socksPort: UInt16 = UWConfig.socksPort,
+    init(relay: GatewayRelay, configuration: GatewayConfiguration, socksPort: UInt16? = nil,
          onStateChange: @escaping () -> Void) {
         self.relay = relay
         self.configuration = configuration
-        self.socksPort = socksPort
+        self.socksPortOverride = socksPort
         self.onStateChange = onStateChange
         for gw in configuration.gateways {
             reloadKeychainCache(for: gw)
@@ -799,28 +807,14 @@ final class TunnelRunner {
     }
 
     private func refreshSurgeIfSplitRulesChanged(gateway: UWGateway) {
-        guard !surgeReloadInFlight else { return }
         let dir = UWConfig.supportDirectory
         let splitText = (try? String(contentsOf: dir.appendingPathComponent("\(gateway.ruleFileStem)-split.list"), encoding: .utf8)) ?? ""
         let excText = (try? String(contentsOf: dir.appendingPathComponent("\(gateway.ruleFileStem)-exclude.list"), encoding: .utf8)) ?? ""
-        let normalized = [gateway.ruleFileStem, splitText, excText].map { text in
+        let snapshot = [gateway.ruleFileStem, splitText, excText].map { text in
             text.split(separator: "\n").filter { !$0.hasPrefix("#") }.joined(separator: "\n")
         }.joined(separator: "\n\n")
-        if normalized == lastSplitHash { return }
-
         guard FileManager.default.isExecutableFile(atPath: UWConfig.surgeCLIPath) else { return }
-        surgeReloadInFlight = true
-        let candidateHash = normalized
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let ok = (try? SurgeModule.command(["reload"])) != nil
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.surgeReloadInFlight = false
-                if ok {
-                    self.lastSplitHash = candidateHash
-                }
-            }
-        }
+        surgeReload.update(snapshot)
     }
 
     private static func isLocalPortOccupied(_ port: UInt16) -> Bool {

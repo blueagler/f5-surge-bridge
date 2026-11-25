@@ -117,7 +117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let runner else { return }
         menu.removeAllItems()
 
-        let header = NSMenuItem(title: "UW-VPN  •  socks5://\(UWConfig.loopbackHost):\(UWConfig.socksPort)", action: nil, keyEquivalent: "")
+        let header = NSMenuItem(title: "UW-VPN  •  socks5://\(UWConfig.loopbackHost):\(runner.socksPort)", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
 

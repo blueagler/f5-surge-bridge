@@ -8,6 +8,17 @@ struct UWGateway: Codable, Hashable {
     let gatewayURL: URL
     let splitRules: Bool?
     var fallbackDNSServers: [String]? = nil
+    let healthCheckURL: URL?
+
+    var effectiveHealthCheckURL: URL? { healthCheckURL }
+
+    init(id: String, name: String, gatewayURL: URL, splitRules: Bool?, healthCheckURL: URL? = nil) {
+        self.id = id
+        self.name = name
+        self.gatewayURL = gatewayURL
+        self.splitRules = splitRules
+        self.healthCheckURL = healthCheckURL
+    }
 
     static let allInternet = UWGateway(id: "all", name: "All Internet", gatewayURL: URL(string: "https://huskyonnet-ns.uw.edu/")!, splitRules: false)
     static let campusOnly = UWGateway(id: "campus", name: "Campus Only", gatewayURL: URL(string: "https://huskyonnet.uw.edu/")!, splitRules: true)
@@ -16,6 +27,10 @@ struct UWGateway: Codable, Hashable {
     var shortLabel: String { name }
     var publishesSplitRules: Bool { splitRules == true }
     var isUWPreset: Bool { [Self.allInternet.gatewayHost, Self.campusOnly.gatewayHost].contains(gatewayHost) }
+    var usesUWRoute: Bool {
+        (id == Self.allInternet.id && gatewayHost == Self.allInternet.gatewayHost) ||
+        (id == Self.campusOnly.id && gatewayHost == Self.campusOnly.gatewayHost)
+    }
     var gatewayDNSFallback: [String] {
         fallbackDNSServers ?? (isUWPreset ? ["1.1.1.1", "2606:4700:4700::1111", "8.8.8.8"] : [])
     }
@@ -33,6 +48,29 @@ struct UWGateway: Codable, Hashable {
     }
 }
 
+struct GatewayRoute: Hashable {
+    let gateway: UWGateway
+    let socksPort: UInt16
+    let policyName: String
+    let splitPolicyName: String
+
+    init(gateway: UWGateway) {
+        self.gateway = gateway
+        if gateway.usesUWRoute {
+            socksPort = UWConfig.socksPort
+            policyName = "UW-VPN"
+            splitPolicyName = "UW-Campus"
+        } else {
+            let offset = SHA256.hash(data: Data(gateway.sessionAccount.utf8)).prefix(4)
+                .reduce(UInt32(0)) { $0 << 8 | UInt32($1) } % 48000
+            socksPort = UInt16(12000 + offset)
+            let suffix = gateway.webStoreUUID.uuidString
+            policyName = "UWVPN-\(suffix)"
+            splitPolicyName = "\(policyName)-Split"
+        }
+    }
+}
+
 struct GatewayConfiguration: Codable {
     let defaultGateway: String
     let gateways: [UWGateway]
@@ -42,6 +80,9 @@ struct GatewayConfiguration: Codable {
     static let file = UWConfig.supportDirectory.appendingPathComponent("config.json")
 
     var defaultSelection: UWGateway { gateways.first { $0.id == defaultGateway }! }
+    var routes: [String: GatewayRoute] {
+        Dictionary(uniqueKeysWithValues: gateways.map { ($0.id, GatewayRoute(gateway: $0)) })
+    }
     var bypassHosts: [String] { Array(Set((gateways.map(\.gatewayHost) + (directHosts ?? [])).map { $0.lowercased() })).sorted() }
 
     static func load(from file: URL = Self.file) throws -> GatewayConfiguration {
@@ -89,8 +130,19 @@ struct GatewayConfiguration: Codable {
             }
         }
         guard ids.contains(defaultGateway) else { throw ConfigurationError("defaultGateway must match a gateway ID.") }
-        guard gateways.filter(\.publishesSplitRules).count <= 1 else {
-            throw ConfigurationError("Only one gateway can publish the shared Surge split rules.")
+        let routes = gateways.map(GatewayRoute.init)
+        for (index, route) in routes.enumerated() {
+            for other in routes.dropFirst(index + 1) {
+                let canonicalUWPair = route.gateway.usesUWRoute && other.gateway.usesUWRoute
+                guard route.socksPort != other.socksPort || canonicalUWPair else {
+                    throw ConfigurationError("Gateways \(route.gateway.id) and \(other.gateway.id) have the same SOCKS port \(route.socksPort). Change one gateway ID.")
+                }
+                guard route.policyName != other.policyName || canonicalUWPair,
+                      route.splitPolicyName != other.splitPolicyName || canonicalUWPair,
+                      route.policyName != other.splitPolicyName, route.splitPolicyName != other.policyName else {
+                    throw ConfigurationError("Gateways \(route.gateway.id) and \(other.gateway.id) have a Surge policy collision. Change one gateway ID.")
+                }
+            }
         }
         guard (directHosts ?? []).allSatisfy(Self.isHostname) else {
             throw ConfigurationError("directHosts must contain plain hostnames.")

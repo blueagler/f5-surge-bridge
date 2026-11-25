@@ -1,6 +1,6 @@
 # UWVPN
 
-UWVPN is a macOS menu bar app for F5 BIG-IP VPNs that use web sign-in. It exposes a SOCKS5 proxy at `127.0.0.1:11080` for Surge. OpenConnect and a gVisor userspace stack carry TCP and UDP over the VPN without creating a system tunnel interface or changing macOS routes.
+UWVPN is a macOS menu bar app for F5 BIG-IP VPNs that use web sign-in. It exposes a fixed loopback SOCKS5 proxy for each configured gateway. The canonical UW gateways use `127.0.0.1:11080` for Surge. OpenConnect and a gVisor userspace stack carry TCP and UDP over the VPN without creating a system tunnel interface or changing macOS routes.
 
 ## Install and connect
 
@@ -30,7 +30,9 @@ Choose **Gateway → Edit Gateway Configuration** to open `~/Library/Application
 }
 ```
 
-At most one gateway can publish split rules. `directHosts` optionally adds Surge exemptions for sign-in domains. Relaunch UWVPN and run **Install / Update Surge Module** after changing the configuration. Supported F5 sign-in flows issue both `MRHSession` and `F5_ST` cookies.
+Each custom gateway gets a fixed SOCKS port and Surge policy derived from its `id` and host. Multiple gateways can publish independent split-rule groups. Set `healthCheckURL` when a custom gateway needs a different Surge health probe. Without it, the module checks public egress with `https://api.ipify.org/`. Existing UW presets keep port `11080`, `UW-VPN`, and `UW-Campus`. A configuration that would reuse a custom port or policy is rejected.
+
+`directHosts` optionally adds Surge exemptions for sign-in domains. Relaunch UWVPN and run **Install / Update Surge Module** after changing the configuration. The module generates proxies and split-rule groups for custom gateways. Keep the definitions in [surge/uw-vpn.conf](surge/uw-vpn.conf) for the UW presets. Supported F5 sign-in flows issue both `MRHSession` and `F5_ST` cookies.
 
 The gateway relay resolves the VPN host using the physical interface's DNS servers. A gateway can list additional resolver IP addresses in `fallbackDNSServers`. The UW presets default to public fallback servers. Custom gateways default to an empty list. An explicit empty list disables those extra lookups. The relay also consults the macOS resolver if the direct lookups return no usable address. Traffic inside the VPN uses the DNS servers assigned by F5.
 

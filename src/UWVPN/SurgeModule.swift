@@ -1,23 +1,79 @@
 import Foundation
 import Darwin
 
+final class SurgeReloadCoordinator {
+    private var desired: String?
+    private var lastLoaded: String?
+    private var active = false
+    private var retryWork: DispatchWorkItem?
+    private let retryDelay: TimeInterval
+    private let reload: (@escaping (Bool) -> Void) -> Void
+
+    init(retryDelay: TimeInterval = 5, reload: @escaping (@escaping (Bool) -> Void) -> Void) {
+        self.retryDelay = retryDelay
+        self.reload = reload
+    }
+
+    func update(_ snapshot: String) {
+        guard snapshot != desired else { return }
+        desired = snapshot
+        start()
+    }
+
+    private func start() {
+        guard !active, let candidate = desired, candidate != lastLoaded else { return }
+        retryWork?.cancel()
+        retryWork = nil
+        active = true
+        reload { [weak self] succeeded in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.active = false
+                self.lastLoaded = succeeded ? candidate : nil
+                if succeeded || self.desired != candidate {
+                    self.start()
+                } else {
+                    let retry = DispatchWorkItem { [weak self] in self?.start() }
+                    self.retryWork = retry
+                    DispatchQueue.main.asyncAfter(deadline: .now() + self.retryDelay, execute: retry)
+                }
+            }
+        }
+    }
+}
+
 enum SurgeModule {
     private static let name = "UW Husky OnNet"
     private static let filename = "uw-vpn.sgmodule"
 
-    static func install(configuration: GatewayConfiguration) throws -> String {
+    static func install(configuration: GatewayConfiguration, support: URL = UWConfig.supportDirectory,
+                        executable: String = UWConfig.surgeCLIPath) throws -> String {
+        func command(_ arguments: [String]) throws -> String {
+            try Self.command(arguments, executable: executable)
+        }
         let policies = try command(["dump", "policy"])
             .split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }
-        let required = configuration.gateways.contains(where: \.publishesSplitRules) ? ["UW-VPN", "UW-Campus"] : ["UW-VPN"]
-        guard required.allSatisfy(policies.contains) else {
-            throw ConfigurationError("Add the \(required.joined(separator: " and ")) definitions to the active Mac Surge profile first. Set udp-relay=true for UW-VPN.")
+        var required = Set<String>()
+        for gateway in configuration.gateways where gateway.usesUWRoute {
+            required.insert("UW-VPN")
+            if gateway.publishesSplitRules { required.insert("UW-Campus") }
+        }
+        guard required.isSubset(of: Set(policies)) else {
+            throw ConfigurationError("Add the \(required.sorted().joined(separator: " and ")) definitions to the active Mac Surge profile first. Set udp-relay=true for UW-VPN.")
         }
         let installed = try? command(["module", "show", name])
-        let destination = try moduleURL(installed: installed)
-        let module = try render(configuration: configuration, support: UWConfig.supportDirectory)
+        let destination = try moduleURL(installed: installed, command: command)
+        let module = try render(configuration: configuration, support: support)
         let previous = FileManager.default.fileExists(atPath: destination.path) ? try Data(contentsOf: destination) : nil
         if let previous, !previous.starts(with: Data("#!name=\(name)\n".utf8)) {
             throw ConfigurationError("A different module already exists at \(destination.path).")
+        }
+        let previousText = previous.map { String(decoding: $0, as: UTF8.self) } ?? ""
+        for route in configuration.routes.values where !route.gateway.usesUWRoute {
+            let names = [route.policyName] + (route.gateway.publishesSplitRules ? [route.splitPolicyName] : [])
+            for policy in names where policies.contains(policy) && !previousText.contains("\(policy) =") {
+                throw ConfigurationError("Surge already has a policy named \(policy). Choose a different gateway ID.")
+            }
         }
         try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data(module.utf8).write(to: destination, options: .atomic)
@@ -53,9 +109,19 @@ enum SurgeModule {
 
     private static func render(configuration: GatewayConfiguration, support: URL) throws -> String {
         var rules = configuration.bypassHosts.map { "DOMAIN,\($0),DIRECT" }
-        if let gateway = configuration.gateways.first(where: \.publishesSplitRules) {
-            try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
-            for (suffix, policy) in [("exclude", "DIRECT"), ("split", "UW-Campus")] {
+        var proxies = [String]()
+        var groups = [String]()
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        for gateway in configuration.gateways {
+            let route = configuration.routes[gateway.id]!
+            let health = gateway.effectiveHealthCheckURL?.absoluteString
+            if !gateway.usesUWRoute {
+                let testURL = health.map { ", test-url=\($0.replacingOccurrences(of: ",", with: "%2C"))" } ?? ""
+                proxies.append("\(route.policyName) = socks5, \(UWConfig.loopbackHost), \(route.socksPort), udp-relay=true\(testURL)")
+            }
+            guard gateway.publishesSplitRules else { continue }
+            let usesGroup = gateway.usesUWRoute || health != nil
+            for (suffix, policy) in [("exclude", "DIRECT"), ("split", usesGroup ? route.splitPolicyName : route.policyName)] {
                 let file = support.appendingPathComponent("\(gateway.ruleFileStem)-\(suffix).list")
                 guard !file.path.contains(","), file.path.rangeOfCharacter(from: .newlines) == nil else {
                     throw ConfigurationError("The split rules folder has a path Surge cannot use.")
@@ -65,11 +131,20 @@ enum SurgeModule {
                 } catch let error as CocoaError where error.code == .fileWriteFileExists {}
                 rules.append("RULE-SET,\(file.path),\(policy)")
             }
+            if !gateway.usesUWRoute && usesGroup {
+                groups.append("\(route.splitPolicyName) = fallback, \(route.policyName), DIRECT, interval=60, evaluate-before-use=true")
+            }
         }
         return """
         #!name=\(name)
-        #!desc=Route VPN split rules and send configured login hosts direct
+        #!desc=Route each VPN through its own gateway and send configured login hosts direct
         #!system=mac
+
+        [Proxy]
+        \(proxies.joined(separator: "\n"))
+
+        [Proxy Group]
+        \(groups.joined(separator: "\n"))
 
         [Rule]
         \(rules.joined(separator: "\n"))
@@ -77,7 +152,7 @@ enum SurgeModule {
         """
     }
 
-    private static func moduleURL(installed: String?) throws -> URL {
+    private static func moduleURL(installed: String?, command: ([String]) throws -> String) throws -> URL {
         if let installed {
             guard installed.split(whereSeparator: \.isNewline).contains("Type: local"),
                   let path = reportedPath(installed), path.lastPathComponent == filename else {
