@@ -15,6 +15,12 @@ concurrency:
   group: uwvpn-${{ github.ref }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
+env:
+  UWVPN_BUILD_MODE: ${{ startsWith(github.ref, 'refs/tags/v') && 'release' || 'adhoc' }}
+  UWVPN_COMMIT: ${{ github.sha }}
+  UWVPN_RELEASE_TAG: ${{ github.ref_name }}
+  UWVPN_BUILD_NUMBER: ${{ github.run_number }}
+
 jobs:
   build:
     name: Build ${{ matrix.arch }}
@@ -27,19 +33,18 @@ jobs:
           - arch: x86_64
             os: macos-26-intel
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - name: Identify native toolchain
         id: toolchain
         run: |
           test "$(uname -m)" = '${{ matrix.arch }}'
-          sdk=$(xcrun --show-sdk-version)
-          xcode=$(xcodebuild -version | awk '/Build version/ { print $3 }')
-          echo "version=$sdk-$xcode" >> "$GITHUB_OUTPUT"
+          echo "fingerprint=$(scripts/build-helpers.sh --fingerprint '${{ matrix.arch }}')" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-go@v7
         with:
@@ -53,15 +58,27 @@ jobs:
             build/helpers-${{ matrix.arch }}/bin/openconnect
             build/helpers-${{ matrix.arch }}/licenses
             build/helpers-${{ matrix.arch }}/fingerprint
-          key: openconnect-${{ matrix.os }}-${{ steps.toolchain.outputs.version }}-${{ hashFiles('scripts/build-helpers.sh', 'src/UWVPN/Info.plist') }}
+          key: openconnect-${{ matrix.os }}-${{ steps.toolchain.outputs.fingerprint }}
+
+      - name: Import the release signing certificate
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          UWVPN_DEVELOPER_ID_P12: ${{ secrets.UWVPN_DEVELOPER_ID_P12 }}
+          UWVPN_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.UWVPN_DEVELOPER_ID_P12_PASSWORD }}
+          UWVPN_CI_KEYCHAIN_PASSWORD: ${{ secrets.UWVPN_CI_KEYCHAIN_PASSWORD }}
+        run: scripts/import-signing-keychain.sh
 
       - name: Build and sign app
+        env:
+          UWVPN_SIGN_IDENTITY: ${{ vars.UWVPN_SIGN_IDENTITY }}
         run: ./scripts/build-app.sh '${{ matrix.arch }}'
 
       - name: Test tunnel and validate app
         run: |
+          python3 tests/build-release.py
           (cd src/tun-socks && CGO_ENABLED=1 go test -mod=readonly -race ./...)
           /bin/zsh -n src/UWVPN/tun-bridge.sh
+          python3 tests/packaged-tunnel.py dist/UWVPN.app
           dist/UWVPN.app/Contents/Resources/bin/openconnect --version
           for executable in Contents/MacOS/UWVPN Contents/Resources/bin/{openconnect,tun-socks}; do
             test "$(lipo -archs "dist/UWVPN.app/$executable")" = '${{ matrix.arch }}'
@@ -80,7 +97,7 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: UWVPN-macOS-${{ matrix.arch }}
+          name: ${{ startsWith(github.ref, 'refs/tags/v') && format('UWVPN-signed-{0}', matrix.arch) || format('UWVPN-macOS-{0}', matrix.arch) }}
           path: dist/UWVPN-macOS-${{ matrix.arch }}.zip
           if-no-files-found: error
           compression-level: 0
@@ -90,33 +107,102 @@ jobs:
     name: Assemble Universal app
     needs: build
     runs-on: macos-26
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v8
         with:
-          pattern: UWVPN-macOS-*
+          pattern: UWVPN-${{ startsWith(github.ref, 'refs/tags/v') && 'signed' || 'macOS' }}-*
           merge-multiple: true
           path: dist
 
+      - name: Import the release signing certificate
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          UWVPN_DEVELOPER_ID_P12: ${{ secrets.UWVPN_DEVELOPER_ID_P12 }}
+          UWVPN_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.UWVPN_DEVELOPER_ID_P12_PASSWORD }}
+          UWVPN_CI_KEYCHAIN_PASSWORD: ${{ secrets.UWVPN_CI_KEYCHAIN_PASSWORD }}
+        run: scripts/import-signing-keychain.sh
+
       - name: Assemble and verify Universal app
-        run: /bin/zsh scripts/build-universal.sh dist
+        env:
+          UWVPN_SIGN_IDENTITY: ${{ vars.UWVPN_SIGN_IDENTITY }}
+        run: |
+          /bin/zsh scripts/build-universal.sh dist
+          ditto -x -k dist/UWVPN-macOS-universal.zip "$RUNNER_TEMP/universal-check"
+          python3 tests/packaged-tunnel.py "$RUNNER_TEMP/universal-check/UWVPN.app"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: UWVPN-macOS-universal
+          name: ${{ startsWith(github.ref, 'refs/tags/v') && 'UWVPN-signed-universal' || 'UWVPN-macOS-universal' }}
           path: dist/UWVPN-macOS-universal.zip
           if-no-files-found: error
           compression-level: 0
           retention-days: 7
 
+  notarize:
+    name: Notarize public release archives
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: universal
+    runs-on: macos-26
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: UWVPN-signed-*
+          merge-multiple: true
+          path: dist
+
+      - name: Import the notary credentials into the temporary keychain
+        env:
+          APPLE_ID: ${{ secrets.UWVPN_APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.UWVPN_APPLE_PASSWORD }}
+          TEAM_ID: ${{ secrets.UWVPN_TEAM_ID }}
+          KEYCHAIN_PASSWORD: ${{ secrets.UWVPN_CI_KEYCHAIN_PASSWORD }}
+        run: |
+          test -n "$APPLE_ID"
+          test -n "$APPLE_PASSWORD"
+          test -n "$TEAM_ID"
+          test -n "$KEYCHAIN_PASSWORD"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/notary.keychain-db"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/notary.keychain-db"
+          xcrun notarytool store-credentials UWVPN-CI \
+            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$TEAM_ID" \
+            --keychain "$RUNNER_TEMP/notary.keychain-db"
+
+      - name: Notarize, staple, and assess every release archive
+        env:
+          UWVPN_SIGN_IDENTITY: ${{ vars.UWVPN_SIGN_IDENTITY }}
+          UWVPN_NOTARY_PROFILE: UWVPN-CI
+          UWVPN_NOTARY_KEYCHAIN: ${{ runner.temp }}/notary.keychain-db
+        run: scripts/notarize-app.sh dist
+
+      - name: Check the extracted Universal archive
+        run: |
+          ditto -x -k dist/UWVPN-macOS-universal.zip "$RUNNER_TEMP/release-check"
+          python3 tests/packaged-tunnel.py "$RUNNER_TEMP/release-check/UWVPN.app"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: UWVPN-public-release
+          path: dist/UWVPN-macOS-*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
   release:
     name: Publish GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: universal
+    needs: notarize
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -124,16 +210,17 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
-          pattern: UWVPN-macOS-*
+          pattern: UWVPN-public-release
           merge-multiple: true
           path: dist
 
-      - name: Upload archives to GitHub Releases
+      - name: Upload verified archives to GitHub Releases
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
+          test "$(find dist -name 'UWVPN-macOS-*.zip' | wc -l)" -eq 3
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/UWVPN-macOS-*.zip --clobber
           else

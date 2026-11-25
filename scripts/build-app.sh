@@ -6,6 +6,7 @@ arch="${1:-$(uname -m)}"
 helpers_dir="${2:-$repo_root/build/helpers-$arch}"
 app_out="${3:-$repo_root/dist/UWVPN.app}"
 src_dir="$repo_root/src/UWVPN"
+source "$repo_root/scripts/build-common.zsh"
 min_macos=$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$src_dir/Info.plist")
 
 case "$arch" in
@@ -32,6 +33,7 @@ rm -rf "$app_out"
 mkdir -p "$app_out/Contents/MacOS" "$app_out/Contents/Resources/bin"
 
 cp "$src_dir/Info.plist" "$app_out/Contents/Info.plist"
+uwvpn_write_metadata "$app_out/Contents/Info.plist"
 cp "$helpers_dir/bin/openconnect" "$app_out/Contents/Resources/bin/openconnect"
 cp "$helpers_dir/bin/tun-socks" "$app_out/Contents/Resources/bin/tun-socks"
 cp "$src_dir/tun-bridge.sh" "$app_out/Contents/Resources/bin/tun-bridge.sh"
@@ -74,9 +76,7 @@ cp "$repo_root/LICENSE" "$licenses_dir/UWVPN.txt"
 xcrun swiftc -target "${arch}-apple-macos${min_macos}" -swift-version 5 -warnings-as-errors -O \
     -framework AppKit -framework Network -framework WebKit -framework Security -framework ServiceManagement \
     -o "$app_out/Contents/MacOS/UWVPN" \
-    "$src_dir/Models.swift" "$src_dir/KeychainStore.swift" "$src_dir/GatewayRelay.swift" \
-    "$src_dir/WebLoginWindow.swift" "$src_dir/TunnelController.swift" "$src_dir/SurgeModule.swift" \
-    "$src_dir/AppDelegate.swift" "$src_dir/main.swift"
+    "$src_dir/"*.swift(N)
 
 for bin in "$app_out/Contents/MacOS/UWVPN" "$app_out/Contents/Resources/bin/"{openconnect,tun-socks}; do
     if otool -L "$bin" | tail -n +2 | grep -qvE '^[[:space:]]+(/usr/lib/|/System/)'; then
@@ -95,6 +95,5 @@ for bin in "$app_out/Contents/MacOS/UWVPN" "$app_out/Contents/Resources/bin/"{op
     fi
 done
 
-codesign --force --deep --sign - "$app_out"
-codesign --verify --deep --strict "$app_out"
-print "Built portable app: $app_out ($arch)"
+uwvpn_sign_app "$app_out"
+print "Built $uwvpn_mode app $uwvpn_version ($uwvpn_build_number) at $uwvpn_revision: $app_out ($arch)"

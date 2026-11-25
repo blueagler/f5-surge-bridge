@@ -36,12 +36,25 @@ The gateway relay resolves the VPN host using the physical interface's DNS serve
 
 ## Build and test
 
-Use macOS 26 or later, Xcode Command Line Tools, and Go 1.27.3 or newer. The script builds pinned OpenConnect and OpenSSL sources and writes the signed app to `dist/UWVPN.app`. It also reuses a previously built OpenConnect binary in `build/helpers-<arch>/bin/`.
+Use macOS 26 or later, Xcode, and Go 1.27.3 or newer. The script builds pinned OpenConnect and OpenSSL sources and writes the app to `dist/UWVPN.app`. It reuses a previously built OpenConnect binary in `build/helpers-<arch>/bin/` when the toolchain fingerprint matches.
+
+Personal builds use ad-hoc signing. Their versions contain `adhoc`, the short source revision, and `dirty` when the checkout has changes. `Info.plist` records the full source revision and distribution mode. Ad-hoc archives are for local use and are never published by the workflow.
 
 ```sh
 ./scripts/build-app.sh
+python3 tests/build-release.py
 (cd src/tun-socks && CGO_ENABLED=0 go test -mod=readonly ./...)
 codesign --verify --deep --strict dist/UWVPN.app
+python3 tests/packaged-tunnel.py dist/UWVPN.app
 ```
 
-See [AGENTS.md](AGENTS.md) for source entry points and verification commands. Each successful GitHub Actions build produces Apple Silicon, Intel and Universal ZIPs. A version tag publishes all three to GitHub Releases.
+See [AGENTS.md](AGENTS.md) for source entry points and verification commands. Pull-request CI builds Apple Silicon, Intel, and Universal archives without signing credentials. A `vMAJOR.MINOR.PATCH` tag requires a clean checkout and produces Developer ID signed, hardened-runtime archives. The release job submits all three archives for notarization, staples each app, runs Gatekeeper checks and `tests/packaged-tunnel.py`, then publishes the verified ZIPs.
+
+Configure the `UWVPN_SIGN_IDENTITY` repository variable with the full Developer ID Application certificate name. Configure these repository secrets:
+
+- `UWVPN_DEVELOPER_ID_P12`: the base64-encoded Developer ID certificate and private key.
+- `UWVPN_DEVELOPER_ID_P12_PASSWORD`: the certificate import password.
+- `UWVPN_CI_KEYCHAIN_PASSWORD`: a strong, random password for temporary CI keychains.
+- `UWVPN_APPLE_ID`, `UWVPN_APPLE_PASSWORD`, and `UWVPN_TEAM_ID`: the Apple account and app-specific password used for notarization.
+
+The workflow stores notary credentials only in a temporary runner keychain. Keep certificates, keychain profiles, and notary credentials out of the repository and build logs. A missing signing identity, mismatched tag, ad-hoc public build, or failed notarization stops publication.

@@ -6,8 +6,15 @@ if [[ "${1:-}" == --fingerprint ]]; then
     {
         /bin/cat "$repo_root/scripts/build-helpers.sh" "$repo_root/src/UWVPN/Info.plist"
         print -r -- "${2:?missing architecture}"
-        xcodebuild -version
+        xcrun swiftc --version
+        /usr/bin/clang --version
         xcrun --show-sdk-version
+        xcrun --show-sdk-path
+        if command -v pkgconf >/dev/null; then
+            pkgconf --version
+        elif command -v pkg-config >/dev/null; then
+            pkg-config --version
+        fi
     } | /usr/bin/shasum -a 256 | /usr/bin/cut -d ' ' -f 1
     exit
 fi
