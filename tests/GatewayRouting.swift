@@ -40,7 +40,7 @@ struct GatewayRoutingTests {
         let script = """
         #!/bin/zsh
         if [[ "$1 $2" == "dump policy" ]]; then
-          print 'UW-VPN\nUW-Campus'
+          print '\(workRoute.policyName)\n\(workRoute.splitPolicyName)\n\(otherRoute.policyName)'
         elif [[ "$1 $2 $3" == "profile section list" ]]; then
           print 'Profile (\(profile.path)/profile.conf)'
         elif [[ "$1 $2" == "module show" ]]; then
@@ -55,8 +55,10 @@ struct GatewayRoutingTests {
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cli.path)
         _ = try SurgeModule.install(configuration: config, support: support, executable: cli.path)
         let module = try String(contentsOf: profile.appendingPathComponent("uw-vpn.sgmodule"), encoding: .utf8)
-        precondition(module.contains("\(workRoute.policyName) = socks5, 127.0.0.1, \(workRoute.socksPort), udp-relay=true, test-url=https://health.example.com/check"))
-        precondition(module.contains("\(workRoute.splitPolicyName) = fallback, \(workRoute.policyName), DIRECT"))
+        let definitions = SurgeModule.profileDefinitions(configuration: config)
+        precondition(definitions.contains("\(workRoute.policyName) = socks5, 127.0.0.1, \(workRoute.socksPort), udp-relay=true, test-url=https://health.example.com/check"))
+        precondition(definitions.contains("\(workRoute.splitPolicyName) = fallback, \(workRoute.policyName), DIRECT"))
+        precondition(!module.contains("[Proxy"))
         precondition(module.contains("\(config.gateways[1].ruleFileStem)-split.list,\(otherRoute.policyName)"))
         precondition(module.contains("DOMAIN,login.example.com,DIRECT"))
         precondition(!module.contains("api.ipify.org"))

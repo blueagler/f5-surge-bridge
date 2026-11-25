@@ -198,6 +198,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         install.target = self
         install.isEnabled = !installingModule
         menu.addItem(install)
+        if configuration.gateways.contains(where: { !$0.usesUWRoute }) {
+            let copyPolicies = NSMenuItem(title: "Copy Custom Surge Policies", action: #selector(copyCustomSurgePolicies), keyEquivalent: "")
+            copyPolicies.target = self
+            menu.addItem(copyPolicies)
+        }
 
         menu.addItem(.separator())
 
@@ -273,6 +278,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    @objc private func copyCustomSurgePolicies() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(SurgeModule.profileDefinitions(configuration: configuration), forType: .string)
+        showAlert("Surge policies copied", "Paste the definitions into the matching sections of your active Mac Surge profile. Then install or update the UWVPN module.")
     }
 
     private func showAlert(_ title: String, _ message: String) {

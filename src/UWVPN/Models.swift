@@ -54,6 +54,14 @@ struct GatewayRoute: Hashable {
     let policyName: String
     let splitPolicyName: String
 
+    var usesCustomFallback: Bool {
+        !gateway.usesUWRoute && gateway.publishesSplitRules && gateway.effectiveHealthCheckURL != nil
+    }
+
+    var splitPolicy: String {
+        gateway.usesUWRoute || usesCustomFallback ? splitPolicyName : policyName
+    }
+
     init(gateway: UWGateway) {
         self.gateway = gateway
         if gateway.usesUWRoute {
