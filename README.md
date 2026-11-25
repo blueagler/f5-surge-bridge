@@ -30,7 +30,7 @@ Choose **Gateway → Edit Gateway Configuration** to open `~/Library/Application
 }
 ```
 
-Each custom gateway gets a fixed SOCKS port and Surge policy derived from its `id` and host. Multiple gateways can publish independent split-rule groups. Set `healthCheckURL` when a custom gateway needs a different Surge health probe. Without it, the module checks public egress with `https://api.ipify.org/`. Existing UW presets keep port `11080`, `UW-VPN`, and `UW-Campus`. A configuration that would reuse a custom port or policy is rejected.
+Each custom gateway gets a fixed loopback SOCKS port and Surge policy derived from its `id` and host. Set `healthCheckURL` to an HTTPS resource reachable through that gateway. This enables a Surge fallback group for its split routes. Without a probe, split routes target the gateway's SOCKS policy directly. The UW presets keep port `11080`, `UW-VPN`, and `UW-Campus`. The app rejects configurations with a port or policy collision.
 
 `directHosts` optionally adds Surge exemptions for sign-in domains. Relaunch UWVPN and run **Install / Update Surge Module** after changing the configuration. The module generates proxies and split-rule groups for custom gateways. Keep the definitions in [surge/uw-vpn.conf](surge/uw-vpn.conf) for the UW presets. Supported F5 sign-in flows issue both `MRHSession` and `F5_ST` cookies.
 

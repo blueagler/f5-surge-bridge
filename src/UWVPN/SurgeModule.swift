@@ -45,9 +45,18 @@ final class SurgeReloadCoordinator {
 enum SurgeModule {
     private static let name = "UW Husky OnNet"
     private static let filename = "uw-vpn.sgmodule"
+    private static let mutationLock = NSLock()
+
+    static func reload() throws {
+        mutationLock.lock()
+        defer { mutationLock.unlock() }
+        _ = try command(["reload"])
+    }
 
     static func install(configuration: GatewayConfiguration, support: URL = UWConfig.supportDirectory,
                         executable: String = UWConfig.surgeCLIPath) throws -> String {
+        mutationLock.lock()
+        defer { mutationLock.unlock() }
         func command(_ arguments: [String]) throws -> String {
             try Self.command(arguments, executable: executable)
         }
@@ -70,7 +79,8 @@ enum SurgeModule {
         }
         let previousText = previous.map { String(decoding: $0, as: UTF8.self) } ?? ""
         for route in configuration.routes.values where !route.gateway.usesUWRoute {
-            let names = [route.policyName] + (route.gateway.publishesSplitRules ? [route.splitPolicyName] : [])
+            let usesGroup = route.gateway.publishesSplitRules && route.gateway.effectiveHealthCheckURL != nil
+            let names = [route.policyName] + (usesGroup ? [route.splitPolicyName] : [])
             for policy in names where policies.contains(policy) && !previousText.contains("\(policy) =") {
                 throw ConfigurationError("Surge already has a policy named \(policy). Choose a different gateway ID.")
             }

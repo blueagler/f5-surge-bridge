@@ -52,7 +52,7 @@ final class TunnelRunner {
     private var reconnectAttempts = 0
     private let surgeReload = SurgeReloadCoordinator { completion in
         DispatchQueue.global(qos: .utility).async {
-            let succeeded = (try? SurgeModule.command(["reload"])) != nil
+            let succeeded = (try? SurgeModule.reload()) != nil
             completion(succeeded)
         }
     }
@@ -813,7 +813,6 @@ final class TunnelRunner {
         let snapshot = [gateway.ruleFileStem, splitText, excText].map { text in
             text.split(separator: "\n").filter { !$0.hasPrefix("#") }.joined(separator: "\n")
         }.joined(separator: "\n\n")
-        guard FileManager.default.isExecutableFile(atPath: UWConfig.surgeCLIPath) else { return }
         surgeReload.update(snapshot)
     }
 
