@@ -3,11 +3,11 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
@@ -21,6 +21,11 @@ type routeRules struct {
 }
 
 func (t *tunnel) publishSplitRules(stem string) error {
+	if len(stem) > 80 || strings.ContainsFunc(stem, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_')
+	}) {
+		return fmt.Errorf("invalid split rule file stem")
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return fmt.Errorf("find home directory: %w", err)
@@ -51,10 +56,14 @@ func (t *tunnel) publishSplitRules(stem string) error {
 		},
 	} {
 		var contents bytes.Buffer
-		fmt.Fprintf(&contents, "# %s on %s\n", set.heading, time.Now().Format("2006-01-02 15:04:05"))
+		fmt.Fprintf(&contents, "# %s\n", set.heading)
 		if set.domains {
 			for _, domain := range strings.Fields(os.Getenv("CISCO_DEF_DOMAIN")) {
-				fmt.Fprintf(&contents, "DOMAIN-SUFFIX,%s\n", domain)
+				if !strings.ContainsFunc(domain, func(r rune) bool {
+					return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '.')
+				}) {
+					fmt.Fprintf(&contents, "DOMAIN-SUFFIX,%s\n", domain)
+				}
 			}
 		}
 		for _, route := range set.routes {
@@ -62,11 +71,11 @@ func (t *tunnel) publishSplitRules(stem string) error {
 				continue
 			}
 			count, _ := strconv.Atoi(os.Getenv(route.environment))
-			for i := 0; i < count; i++ {
+			for i := 0; i < min(count, 65536); i++ {
 				address := os.Getenv(fmt.Sprintf("%s_%d_ADDR", route.environment, i))
 				mask := os.Getenv(fmt.Sprintf("%s_%d_MASKLEN", route.environment, i))
-				if address != "" && mask != "" {
-					fmt.Fprintf(&contents, "%s,%s/%s,no-resolve\n", route.kind, address, mask)
+				if prefix, err := netip.ParsePrefix(address + "/" + mask); err == nil && networkProtocol(prefix.Addr()) == route.protocol {
+					fmt.Fprintf(&contents, "%s,%s,no-resolve\n", route.kind, prefix.Masked())
 				}
 			}
 		}

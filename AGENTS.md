@@ -4,7 +4,7 @@
 
 - `src/UWVPN/AppDelegate.swift` owns the macOS menu, configuration and system events. `Models.swift` validates gateway configuration. `WebLoginWindow.swift` and `KeychainStore.swift` manage sign-in and sessions.
 - `src/UWVPN/GatewayRelay.swift` binds gateway connections to the physical interface. Keep the CONNECT host allowlist and reject Surge fake addresses in both IP families.
-- `src/UWVPN/TunnelController.swift` owns OpenConnect and starts `tun-bridge.sh`. The script emits split rules and hands OpenConnect’s inherited `VPNFD` to `src/tun-socks/`.
+- `src/UWVPN/TunnelController.swift` owns OpenConnect and starts `tun-bridge.sh`. The script hands OpenConnect’s inherited `VPNFD` to `src/tun-socks/`. The helper publishes Surge split rules using the addresses and MTU it actually supports.
 - `src/tun-socks/` implements loopback SOCKS5 TCP/UDP and VPN DNS through gVisor. Preserve raw packet boundaries and keep destination traffic inside the userspace tunnel.
 - `src/UWVPN/SurgeModule.swift` generates and enables the macOS Surge module. `surge/uw-vpn.conf` contains the user’s Surge profile definitions.
 - `scripts/build-app.sh` packages one architecture. `scripts/build-helpers.sh` builds pinned native dependencies. `scripts/build-universal.sh` assembles two signed architecture archives. `.github/workflows/release.yml` owns CI and publishing.

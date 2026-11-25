@@ -9,7 +9,7 @@ import tempfile
 import time
 
 
-def start_tunnel(app, home, port, ipv6, send_buffer=1000):
+def start_tunnel(app, home, port, ipv6, send_buffer=1000, rule_stem="test-rules"):
     resources = app / "Contents" / "Resources" / "bin"
     left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
     right.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, send_buffer)
@@ -39,7 +39,7 @@ def start_tunnel(app, home, port, ipv6, send_buffer=1000):
         "CISCO_IPV6_SPLIT_EXC_0_MASKLEN": "64",
     })
     proc = subprocess.Popen(
-        [str(resources / "tun-bridge.sh"), "fixture", str(port), "test-rules"],
+        [str(resources / "tun-bridge.sh"), "fixture", str(port), rule_stem],
         env=env,
         pass_fds=(right.fileno(),),
         stdout=subprocess.PIPE,
@@ -139,6 +139,14 @@ def main():
                 proc.kill()
                 proc.wait()
             blocker.close()
+
+        proc, peer = start_tunnel(app, home, port, "::", rule_stem="")
+        try:
+            wait_for_greeting(proc, port)
+            assert not list((home / "Library" / "Application Support" / "UWVPN").glob("*.list"))
+            print("PASS gateway with split rules disabled publishes no rules")
+        finally:
+            stop_tunnel(proc, peer)
 
 
 if __name__ == "__main__":

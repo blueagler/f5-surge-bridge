@@ -64,7 +64,7 @@ func run() error {
 		return err
 	}
 	defer listener.Close()
-	if len(os.Args) == 3 {
+	if len(os.Args) == 3 && os.Args[2] != "" {
 		if err := vpn.publishSplitRules(os.Args[2]); err != nil {
 			return err
 		}
