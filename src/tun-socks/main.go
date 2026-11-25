@@ -27,8 +27,8 @@ func main() {
 }
 
 func run() error {
-	if len(os.Args) != 2 {
-		return fmt.Errorf("usage: tun-socks port")
+	if len(os.Args) < 2 || len(os.Args) > 3 {
+		return fmt.Errorf("usage: tun-socks port [rule-stem]")
 	}
 	port, err := strconv.ParseUint(os.Args[1], 10, 16)
 	if err != nil || port == 0 {
@@ -64,6 +64,11 @@ func run() error {
 		return err
 	}
 	defer listener.Close()
+	if len(os.Args) == 3 {
+		if err := vpn.publishSplitRules(os.Args[2]); err != nil {
+			return err
+		}
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGHUP, syscall.SIGTERM, os.Interrupt)
 	defer cancel()
