@@ -3,81 +3,232 @@ name: Build & Release UWVPN
 on:
   push:
     branches: [main]
-    tags: ["v*"]
+    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: uwvpn-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  UWVPN_BUILD_MODE: ${{ startsWith(github.ref, 'refs/tags/v') && 'release' || 'adhoc' }}
+  UWVPN_COMMIT: ${{ github.sha }}
+  UWVPN_RELEASE_TAG: ${{ github.ref_name }}
+  UWVPN_BUILD_NUMBER: ${{ github.run_number }}
 
 jobs:
   build:
+    name: Build ${{ matrix.arch }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: arm64
-            os: macos-14
+            os: macos-26
           - arch: x86_64
-            os: macos-15-intel
+            os: macos-26-intel
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install OpenSSL static libs via Homebrew
-        run: brew install openssl@3 pkgconf
-
-      - name: Build UWVPN.app (${{ matrix.arch }})
-        env:
-          OPENSSL_ROOT_DIR: ${{ matrix.arch == 'arm64' && '/opt/homebrew/opt/openssl@3' || '/usr/local/opt/openssl@3' }}
-        run: |
-          chmod +x scripts/build-helpers.sh scripts/build-app.sh
-          ./scripts/build-app.sh "${{ matrix.arch }}" "build/helpers-${{ matrix.arch }}" "dist/UWVPN-${{ matrix.arch }}/UWVPN.app"
-
-      - name: Verify tun-bridge.sh and app bundle
-        run: |
-          /bin/zsh -n src/UWVPN/tun-bridge.sh
-          codesign --verify --deep --strict "dist/UWVPN-${{ matrix.arch }}/UWVPN.app"
-          ditto -c -k --sequesterRsrc --keepParent "dist/UWVPN-${{ matrix.arch }}/UWVPN.app" "dist/UWVPN-macOS-${{ matrix.arch }}.zip"
-
-      - uses: actions/upload-artifact@v4
+      - uses: actions/checkout@v7
         with:
-          name: UWVPN-macOS-${{ matrix.arch }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Identify native toolchain
+        id: toolchain
+        run: |
+          test "$(uname -m)" = '${{ matrix.arch }}'
+          echo "fingerprint=$(scripts/build-helpers.sh --fingerprint '${{ matrix.arch }}')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.4'
+          cache-dependency-path: src/tun-socks/go.sum
+
+      - name: Cache portable OpenConnect
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/helpers-${{ matrix.arch }}/bin/openconnect
+            build/helpers-${{ matrix.arch }}/licenses
+            build/helpers-${{ matrix.arch }}/fingerprint
+          key: openconnect-${{ matrix.os }}-${{ steps.toolchain.outputs.fingerprint }}
+
+      - name: Import the release signing certificate
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          UWVPN_DEVELOPER_ID_P12: ${{ secrets.UWVPN_DEVELOPER_ID_P12 }}
+          UWVPN_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.UWVPN_DEVELOPER_ID_P12_PASSWORD }}
+          UWVPN_CI_KEYCHAIN_PASSWORD: ${{ secrets.UWVPN_CI_KEYCHAIN_PASSWORD }}
+        run: scripts/import-signing-keychain.sh
+
+      - name: Build and sign app
+        env:
+          UWVPN_SIGN_IDENTITY: ${{ vars.UWVPN_SIGN_IDENTITY }}
+        run: ./scripts/build-app.sh '${{ matrix.arch }}'
+
+      - name: Test tunnel and validate app
+        run: |
+          python3 tests/build-release.py
+          (cd src/tun-socks && CGO_ENABLED=1 go test -mod=readonly -race ./...)
+          /bin/zsh -n src/UWVPN/tun-bridge.sh
+          dist/UWVPN.app/Contents/Resources/bin/openconnect --version
+          for executable in Contents/MacOS/UWVPN Contents/Resources/bin/{openconnect,tun-socks}; do
+            test "$(lipo -archs "dist/UWVPN.app/$executable")" = '${{ matrix.arch }}'
+          done
+
+      - name: Test gateway routing, relay recovery, and DNS configuration
+        if: matrix.arch == 'arm64'
+        run: |
+          /bin/zsh tests/gateway-relay.sh
+          /bin/zsh tests/gateway-routing.sh
+
+      - name: Test recovery when the SOCKS5 helper exits
+        if: matrix.arch == 'arm64'
+        run: /bin/zsh tests/tunnel-recovery.sh
+
+      - name: Package app
+        run: |
+          archive='dist/UWVPN-macOS-${{ matrix.arch }}.zip'
+          ditto -c -k --sequesterRsrc --keepParent dist/UWVPN.app "$archive"
+          ditto -x -k "$archive" "$RUNNER_TEMP/arch-check"
+          codesign --verify --deep --strict "$RUNNER_TEMP/arch-check/UWVPN.app"
+          python3 tests/packaged-tunnel.py "$RUNNER_TEMP/arch-check/UWVPN.app"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ startsWith(github.ref, 'refs/tags/v') && format('UWVPN-signed-{0}', matrix.arch) || format('UWVPN-macOS-{0}', matrix.arch) }}
           path: dist/UWVPN-macOS-${{ matrix.arch }}.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  universal:
+    name: Assemble Universal app
+    needs: build
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: UWVPN-${{ startsWith(github.ref, 'refs/tags/v') && 'signed' || 'macOS' }}-*
+          merge-multiple: true
+          path: dist
+
+      - name: Import the release signing certificate
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          UWVPN_DEVELOPER_ID_P12: ${{ secrets.UWVPN_DEVELOPER_ID_P12 }}
+          UWVPN_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.UWVPN_DEVELOPER_ID_P12_PASSWORD }}
+          UWVPN_CI_KEYCHAIN_PASSWORD: ${{ secrets.UWVPN_CI_KEYCHAIN_PASSWORD }}
+        run: scripts/import-signing-keychain.sh
+
+      - name: Assemble and verify Universal app
+        env:
+          UWVPN_SIGN_IDENTITY: ${{ vars.UWVPN_SIGN_IDENTITY }}
+        run: |
+          /bin/zsh scripts/build-universal.sh dist
+          ditto -x -k dist/UWVPN-macOS-universal.zip "$RUNNER_TEMP/universal-check"
+          python3 tests/packaged-tunnel.py "$RUNNER_TEMP/universal-check/UWVPN.app"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ startsWith(github.ref, 'refs/tags/v') && 'UWVPN-signed-universal' || 'UWVPN-macOS-universal' }}
+          path: dist/UWVPN-macOS-universal.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  notarize:
+    name: Notarize public release archives
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: universal
+    runs-on: macos-26
+    timeout-minutes: 110
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: UWVPN-signed-*
+          merge-multiple: true
+          path: dist
+
+      - name: Import the notary credentials into the temporary keychain
+        env:
+          APPLE_ID: ${{ secrets.UWVPN_APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.UWVPN_APPLE_PASSWORD }}
+          TEAM_ID: ${{ secrets.UWVPN_TEAM_ID }}
+          KEYCHAIN_PASSWORD: ${{ secrets.UWVPN_CI_KEYCHAIN_PASSWORD }}
+        run: |
+          test -n "$APPLE_ID"
+          test -n "$APPLE_PASSWORD"
+          test -n "$TEAM_ID"
+          test -n "$KEYCHAIN_PASSWORD"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/notary.keychain-db"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$RUNNER_TEMP/notary.keychain-db"
+          xcrun notarytool store-credentials UWVPN-CI \
+            --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$TEAM_ID" \
+            --keychain "$RUNNER_TEMP/notary.keychain-db"
+
+      - name: Notarize, staple, and assess every release archive
+        env:
+          UWVPN_SIGN_IDENTITY: ${{ vars.UWVPN_SIGN_IDENTITY }}
+          UWVPN_NOTARY_PROFILE: UWVPN-CI
+          UWVPN_NOTARY_KEYCHAIN: ${{ runner.temp }}/notary.keychain-db
+        run: scripts/notarize-app.sh dist
+
+      - name: Check the extracted Universal archive
+        run: |
+          ditto -x -k dist/UWVPN-macOS-universal.zip "$RUNNER_TEMP/release-check"
+          python3 tests/packaged-tunnel.py "$RUNNER_TEMP/release-check/UWVPN.app"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: UWVPN-public-release
+          path: dist/UWVPN-macOS-*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
 
   release:
+    name: Publish GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
-    runs-on: macos-14
+    needs: notarize
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
-          path: artifacts
+          pattern: UWVPN-public-release
+          merge-multiple: true
+          path: dist
 
-      - name: Combine Universal UWVPN.app
+      - name: Upload verified archives to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
         run: |
-          mkdir -p dist/universal
-          ditto -x -k artifacts/UWVPN-macOS-arm64/UWVPN-macOS-arm64.zip dist/arm64
-          ditto -x -k artifacts/UWVPN-macOS-x86_64/UWVPN-macOS-x86_64.zip dist/x86_64
-          cp -R dist/arm64/UWVPN.app dist/universal/UWVPN.app
-          for rel in Contents/MacOS/UWVPN Contents/Resources/bin/openconnect Contents/Resources/bin/ocproxy; do
-            lipo -create \
-              "dist/arm64/UWVPN.app/$rel" \
-              "dist/x86_64/UWVPN.app/$rel" \
-              -output "dist/universal/UWVPN.app/$rel"
-          done
-          codesign --force --deep --sign - dist/universal/UWVPN.app
-          codesign --verify --deep --strict dist/universal/UWVPN.app
-          ditto -c -k --sequesterRsrc --keepParent dist/universal/UWVPN.app dist/UWVPN-macOS-universal.zip
-          cp artifacts/UWVPN-macOS-arm64/UWVPN-macOS-arm64.zip dist/
-          cp artifacts/UWVPN-macOS-x86_64/UWVPN-macOS-x86_64.zip dist/
-
-      - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: |
-            dist/UWVPN-macOS-universal.zip
-            dist/UWVPN-macOS-arm64.zip
-            dist/UWVPN-macOS-x86_64.zip
+          test "$(find dist -name 'UWVPN-macOS-*.zip' | wc -l)" -eq 3
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/UWVPN-macOS-*.zip --clobber
+          else
+            gh release create "$TAG" dist/UWVPN-macOS-*.zip --verify-tag --generate-notes
+          fi

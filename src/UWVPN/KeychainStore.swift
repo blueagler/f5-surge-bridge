@@ -8,7 +8,7 @@ enum KeychainStore {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: gateway.rawValue,
+            kSecAttrAccount as String: gateway.sessionAccount,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
@@ -35,7 +35,7 @@ enum KeychainStore {
             let query: [String: Any] = [
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrService as String: service,
-                kSecAttrAccount as String: gateway.rawValue
+                kSecAttrAccount as String: gateway.sessionAccount
             ]
             let attributes: [String: Any] = [
                 kSecValueData as String: data,
@@ -67,7 +67,7 @@ enum KeychainStore {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: gateway.rawValue
+            kSecAttrAccount as String: gateway.sessionAccount
         ]
         let status = SecItemDelete(query as CFDictionary)
         if status == errSecSuccess || status == errSecItemNotFound {

@@ -1,18 +1,93 @@
 import Darwin
 import Foundation
+import OSLog
 import SystemConfiguration
 
 final class GatewayRelay {
-    private let allowedHosts = UWGateway.allowedGatewayHosts
+    private static let logger = Logger(subsystem: "com.blueagle.uwvpn", category: "GatewayRelay")
+    private let gatewayDNS: [String: [String]]
+    private let acceptClient: (Int32) -> Int32
     private let maxHeaderBytes = 8192
     private let maxConcurrentTunnels = 64
     private let ioBufferBytes = 16384
     private let handshakeTimeoutSec: TimeInterval = 15.0
-    private let dnsTimeoutSec = 5
+    private let dnsTimeoutSec = 1
     private let dnsCacheTTL: TimeInterval = 60.0
     private let pathCacheTTL: TimeInterval = 15.0
-    private let surgeFakeNetMask: UInt32 = 0xFFFE_0000
-    private let surgeFakeNetBase: UInt32 = 0xC612_0000 // 198.18.0.0/15
+
+    init(gateways: [UWGateway], acceptClient: @escaping (Int32) -> Int32 = { Darwin.accept($0, nil, nil) }) {
+        gatewayDNS = Dictionary(gateways.map { ($0.gatewayHost, $0.gatewayDNSFallback) }, uniquingKeysWith: { first, _ in first })
+        self.acceptClient = acceptClient
+    }
+
+    private enum IPAddress {
+        case v4(in_addr)
+        case v6(in6_addr)
+
+        init?(_ text: String) {
+            var v4 = in_addr()
+            var v6 = in6_addr()
+            if inet_pton(AF_INET, text, &v4) == 1 {
+                self = .v4(v4)
+            } else if inet_pton(AF_INET6, text, &v6) == 1 {
+                self = .v6(v6)
+            } else {
+                return nil
+            }
+        }
+
+        init(_ address: UnsafePointer<sockaddr>) {
+            if address.pointee.sa_family == AF_INET6 {
+                self = .v6(address.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee.sin6_addr })
+            } else {
+                self = .v4(address.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee.sin_addr })
+            }
+        }
+
+        var family: Int32 {
+            if case .v4 = self { return AF_INET }
+            return AF_INET6
+        }
+
+        var isUsable: Bool {
+            switch self {
+            case .v4(let address):
+                let ip = UInt32(bigEndian: address.s_addr)
+                return ip != 0 && ip & 0xFFFE_0000 != 0xC612_0000 // Surge 198.18.0.0/15
+            case .v6(var address):
+                return withUnsafeBytes(of: &address) { ip in
+                    let surgePrefix: [UInt8] = [0xfd, 0, 0x61, 0x52]
+                    return ip.contains { $0 != 0 } && !ip.starts(with: surgePrefix)
+                }
+            }
+        }
+
+        func connect(_ fd: Int32, port: UInt16, ifaceIndex: UInt32) -> Int32 {
+            switch self {
+            case .v4(let address):
+                var endpoint = sockaddr_in()
+                endpoint.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+                endpoint.sin_family = sa_family_t(AF_INET)
+                endpoint.sin_port = port.bigEndian
+                endpoint.sin_addr = address
+                return withUnsafePointer(to: &endpoint) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+                }
+            case .v6(let address):
+                var endpoint = sockaddr_in6()
+                endpoint.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+                endpoint.sin6_family = sa_family_t(AF_INET6)
+                endpoint.sin6_port = port.bigEndian
+                endpoint.sin6_addr = address
+                if withUnsafeBytes(of: address, { $0[0] == 0xfe && $0[1] & 0xc0 == 0x80 }) {
+                    endpoint.sin6_scope_id = ifaceIndex
+                }
+                return withUnsafePointer(to: &endpoint) {
+                    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size)) }
+                }
+            }
+        }
+    }
 
     private struct NetworkSnapshot {
         let ifaceName: String
@@ -22,12 +97,31 @@ final class GatewayRelay {
     }
 
     private struct CachedAddresses {
-        let addresses: [in_addr]
+        let addresses: [IPAddress]
         let expiresAt: TimeInterval
     }
 
+    private final class DNSAnswers: @unchecked Sendable {
+        private let lock = NSLock()
+        private var addresses: [UInt8: [IPAddress]] = [:]
+
+        func store(_ result: [IPAddress], type: UInt8) {
+            lock.lock()
+            addresses[type] = result
+            lock.unlock()
+        }
+
+        var combined: [IPAddress] {
+            lock.lock()
+            defer { lock.unlock() }
+            return (addresses[1] ?? []) + (addresses[28] ?? [])
+        }
+    }
+
     private let lock = NSLock()
-    private var listenFD: Int32 = -1
+    private let listenerQueue = DispatchQueue(label: "com.blueagle.uwvpn.relay.listener")
+    private var listener: DispatchSourceRead?
+    private var listenerGeneration: UInt64 = 0
     private(set) var port: UInt16 = 0
     private var running = false
     private var activeFDs: Set<Int32> = []
@@ -37,13 +131,16 @@ final class GatewayRelay {
     private let workerQueue = DispatchQueue(label: "com.blueagle.uwvpn.relay.workers", attributes: .concurrent)
 
     func start() throws {
-        lock.lock()
-        if running {
+        try listenerQueue.sync {
+            guard !isRunning() else { return }
+            try openListener(port: 0)
+            lock.lock()
+            running = true
             lock.unlock()
-            return
         }
-        lock.unlock()
+    }
 
+    private func openListener(port requestedPort: UInt16) throws {
         let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
         configureSocketFlags(fd)
@@ -54,7 +151,7 @@ final class GatewayRelay {
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = 0
+        addr.sin_port = requestedPort.bigEndian
         addr.sin_addr = in_addr(s_addr: inet_addr(UWConfig.loopbackHost))
 
         let bindRes = withUnsafePointer(to: &addr) {
@@ -87,30 +184,24 @@ final class GatewayRelay {
             throw NSError(domain: NSPOSIXErrorDomain, code: Int(err))
         }
 
-        lock.lock()
-        port = UInt16(bigEndian: bound.sin_port)
-        listenFD = fd
-        running = true
-        lock.unlock()
-
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.acceptLoop()
-        }
+        setNonBlocking(fd, enabled: true)
+        if requestedPort == 0 { port = UInt16(bigEndian: bound.sin_port) }
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: listenerQueue)
+        source.setEventHandler { [weak self] in self?.acceptNext(fd) }
+        source.setCancelHandler { Darwin.close(fd) }
+        listener = source
+        source.activate()
     }
 
     func stop() {
-        lock.lock()
-        running = false
-        let lfd = listenFD
-        listenFD = -1
-        let fds = activeFDs
-        activeFDs.removeAll()
-        lock.unlock()
-
-        if lfd >= 0 { Darwin.close(lfd) }
-        for fd in fds {
-            Darwin.shutdown(fd, SHUT_RDWR)
-            Darwin.close(fd)
+        listenerQueue.sync {
+            listenerGeneration &+= 1
+            listener?.cancel()
+            listener = nil
+            lock.lock()
+            running = false
+            for fd in activeFDs { Darwin.shutdown(fd, SHUT_RDWR) }
+            lock.unlock()
         }
     }
 
@@ -132,10 +223,15 @@ final class GatewayRelay {
         return r
     }
 
-    private func registerFD(_ fd: Int32) {
+    private func trackConnectedFD(_ fd: Int32) -> Int32? {
         lock.lock()
+        defer { lock.unlock() }
+        guard running else {
+            Darwin.close(fd)
+            return nil
+        }
         activeFDs.insert(fd)
-        lock.unlock()
+        return fd
     }
 
     private func closeTrackedFD(_ fd: Int32) {
@@ -147,45 +243,46 @@ final class GatewayRelay {
         }
     }
 
-    private func acceptLoop() {
-        while true {
-            lock.lock()
-            let shouldContinue = running
-            let fd = listenFD
-            lock.unlock()
-            guard shouldContinue, fd >= 0 else { break }
-
-            var clientAddr = sockaddr_storage()
-            var addrLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
-            let clientFD = withUnsafeMutablePointer(to: &clientAddr) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    Darwin.accept(fd, $0, &addrLen)
-                }
+    private func acceptNext(_ fd: Int32) {
+        guard let source = listener, source.handle == fd else { return }
+        let clientFD = acceptClient(fd)
+        if clientFD < 0 {
+            let failure = errno
+            switch failure {
+            case EAGAIN, EINTR, ECONNABORTED: break
+            case EMFILE, ENFILE, ENOBUFS, ENOMEM:
+                source.suspend()
+                listenerQueue.asyncAfter(deadline: .now() + 0.25) { source.resume() }
+            default:
+                Self.logger.error("Reopening gateway listener after accept errno \(failure, privacy: .public)")
+                source.cancel()
+                listener = nil
+                scheduleListenerRecovery(generation: listenerGeneration)
             }
-            if clientFD < 0 {
-                if errno == EINTR { continue }
-                break
-            }
+            return
+        }
+        configureSocketFlags(clientFD)
+        setNonBlocking(clientFD, enabled: false)
+        lock.lock()
+        let admitted = activeTunnelCount < maxConcurrentTunnels
+        if admitted {
+            activeTunnelCount += 1
+            activeFDs.insert(clientFD)
+        }
+        lock.unlock()
+        guard admitted else {
+            sendAll(clientFD, Data("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n".utf8))
+            Darwin.close(clientFD)
+            return
+        }
+        workerQueue.async { self.handleClient(clientFD) }
+    }
 
-            configureSocketFlags(clientFD)
-
-            lock.lock()
-            let canAccept = running && activeTunnelCount < maxConcurrentTunnels
-            if canAccept {
-                activeTunnelCount += 1
-                activeFDs.insert(clientFD)
-            }
-            lock.unlock()
-
-            if !canAccept {
-                sendAll(clientFD, Data("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n".utf8))
-                Darwin.close(clientFD)
-                continue
-            }
-
-            workerQueue.async { [weak self] in
-                self?.handleClient(clientFD)
-            }
+    private func scheduleListenerRecovery(generation: UInt64) {
+        listenerQueue.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self, self.listenerGeneration == generation, self.isRunning() else { return }
+            do { try self.openListener(port: self.port) }
+            catch { self.scheduleListenerRecovery(generation: generation) }
         }
     }
 
@@ -244,11 +341,11 @@ final class GatewayRelay {
             }
         }
 
-        let authority = parts[1].split(separator: ":", omittingEmptySubsequences: false)
-        guard authority.count == 2,
-              let host = authority.first.map({ String($0).lowercased() }),
-              authority[1] == String(UWConfig.httpsPort),
-              allowedHosts.contains(host) else {
+        let authority = parts[1]
+        let suffix = ":\(UWConfig.httpsPort)"
+        let host = authority.dropLast(suffix.count).lowercased()
+        guard authority.hasSuffix(suffix),
+              let fallbackServers = gatewayDNS[host] else {
             sendAll(clientFD, Data("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n".utf8))
             return
         }
@@ -258,7 +355,7 @@ final class GatewayRelay {
             return
         }
 
-        let candidates = resolveGatewayIPv4(host: host, snapshot: snapshot)
+        let candidates = resolveGateway(host: host, snapshot: snapshot, fallbackServers: fallbackServers, deadline: deadline)
         guard !candidates.isEmpty else {
             sendAll(clientFD, Data("HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n".utf8))
             return
@@ -322,35 +419,23 @@ final class GatewayRelay {
         }
     }
 
-    private func dialCandidates(_ addresses: [in_addr], ifaceIndex: UInt32, deadline: Date) -> Int32? {
+    private func dialCandidates(_ addresses: [IPAddress], ifaceIndex: UInt32, deadline: Date) -> Int32? {
         for addr in addresses {
             if !isRunning() || Date() >= deadline { return nil }
-            let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+            let fd = Darwin.socket(addr.family, SOCK_STREAM, 0)
             guard fd >= 0 else { continue }
             configureSocketFlags(fd)
 
-            var idx = ifaceIndex
-            guard setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &idx, socklen_t(MemoryLayout<UInt32>.size)) == 0 else {
+            guard bindInterface(fd, family: addr.family, ifaceIndex: ifaceIndex) else {
                 Darwin.close(fd)
-                return nil
+                continue
             }
             setNonBlocking(fd, enabled: true)
 
-            var sin = sockaddr_in()
-            sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-            sin.sin_family = sa_family_t(AF_INET)
-            sin.sin_port = UWConfig.httpsPort.bigEndian
-            sin.sin_addr = addr
-
-            let res = withUnsafePointer(to: &sin) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                    Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-                }
-            }
+            let res = addr.connect(fd, port: UWConfig.httpsPort, ifaceIndex: ifaceIndex)
             if res == 0 {
                 setNonBlocking(fd, enabled: false)
-                registerFD(fd)
-                return fd
+                return trackConnectedFD(fd)
             }
             if errno != EINPROGRESS {
                 Darwin.close(fd)
@@ -358,8 +443,9 @@ final class GatewayRelay {
             }
 
             var connected = false
+            let attemptDeadline = min(deadline, Date().addingTimeInterval(3))
             while isRunning() {
-                let remainingMs = Int32(max(0, deadline.timeIntervalSinceNow * 1000.0))
+                let remainingMs = Int32(max(0, attemptDeadline.timeIntervalSinceNow * 1000.0))
                 if remainingMs <= 0 { break }
                 var pfd = pollfd(fd: fd, events: Int16(POLLOUT), revents: 0)
                 let pr = Darwin.poll(&pfd, 1, remainingMs)
@@ -378,12 +464,18 @@ final class GatewayRelay {
 
             if connected {
                 setNonBlocking(fd, enabled: false)
-                registerFD(fd)
-                return fd
+                return trackConnectedFD(fd)
             }
             Darwin.close(fd)
         }
         return nil
+    }
+
+    private func bindInterface(_ fd: Int32, family: Int32, ifaceIndex: UInt32) -> Bool {
+        var idx = ifaceIndex
+        let level = family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP
+        let option = family == AF_INET6 ? IPV6_BOUND_IF : IP_BOUND_IF
+        return setsockopt(fd, level, option, &idx, socklen_t(MemoryLayout<UInt32>.size)) == 0
     }
 
     private func pump(fdA: Int32, fdB: Int32) {
@@ -484,17 +576,26 @@ final class GatewayRelay {
         // Prefer primary interface if it is a physical en* interface; otherwise inspect all active services.
         var candidateIfaces: [(name: String, index: UInt32, dns: [String])] = []
         var primaryName: String?
-        if let globalIPv4 = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any],
-           let pName = globalIPv4["PrimaryInterface"] as? String {
-            primaryName = pName
+        for family in ["IPv4", "IPv6"] {
+            if let state = SCDynamicStoreCopyValue(store, "State:/Network/Global/\(family)" as CFString) as? [String: Any],
+               let name = state["PrimaryInterface"] as? String, name.hasPrefix("en") {
+                primaryName = name
+                break
+            }
         }
 
-        if let orderDict = SCDynamicStoreCopyValue(store, "Setup:/Network/Global/IPv4" as CFString) as? [String: Any],
-           let serviceOrder = orderDict["ServiceOrder"] as? [String] {
-            for serviceID in serviceOrder {
-                guard let ipv4 = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(serviceID)/IPv4" as CFString) as? [String: Any],
-                      let ifName = ipv4["InterfaceName"] as? String,
-                      ifName.hasPrefix("en") else {
+        let serviceOrder = ["IPv4", "IPv6"].flatMap { family -> [String] in
+            let order = SCDynamicStoreCopyValue(store, "Setup:/Network/Global/\(family)" as CFString) as? [String: Any]
+            return order?["ServiceOrder"] as? [String] ?? []
+        }
+        var seenServices = Set<String>()
+        do {
+            for serviceID in serviceOrder where seenServices.insert(serviceID).inserted {
+                let ifName = ["IPv4", "IPv6"].compactMap { family -> String? in
+                    let state = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(serviceID)/\(family)" as CFString) as? [String: Any]
+                    return state?["InterfaceName"] as? String
+                }.first { $0.hasPrefix("en") }
+                guard let ifName else {
                     continue
                 }
                 let idx = if_nametoindex(ifName)
@@ -502,7 +603,7 @@ final class GatewayRelay {
                 var dns: [String] = []
                 if let dnsDict = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(serviceID)/DNS" as CFString) as? [String: Any],
                    let servers = dnsDict["ServerAddresses"] as? [String] {
-                    dns = servers.filter { Self.isUsableIPv4DNS($0, fakeMask: surgeFakeNetMask, fakeBase: surgeFakeNetBase) }
+                    dns = servers
                 }
                 candidateIfaces.append((ifName, idx, dns))
             }
@@ -535,7 +636,7 @@ final class GatewayRelay {
             let flags = Int32(node.pointee.ifa_flags)
             if (flags & IFF_UP) != 0, (flags & IFF_RUNNING) != 0,
                let namePtr = node.pointee.ifa_name,
-               let sa = node.pointee.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET) {
+               let sa = node.pointee.ifa_addr, [UInt8(AF_INET), UInt8(AF_INET6)].contains(sa.pointee.sa_family) {
                 let name = String(cString: namePtr)
                 if name.hasPrefix("en") {
                     let idx = if_nametoindex(name)
@@ -547,7 +648,10 @@ final class GatewayRelay {
         return nil
     }
 
-    private func resolveGatewayIPv4(host: String, snapshot: NetworkSnapshot) -> [in_addr] {
+    private func resolveGateway(host: String, snapshot: NetworkSnapshot, fallbackServers: [String], deadline: Date) -> [IPAddress] {
+        if let address = IPAddress(host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))) {
+            return address.isUsable ? [address] : []
+        }
         let now = Date().timeIntervalSince1970
         lock.lock()
         if let entry = dnsCache[host], entry.expiresAt > now, !entry.addresses.isEmpty {
@@ -556,12 +660,24 @@ final class GatewayRelay {
         }
         lock.unlock()
 
-        // Try physical-interface DHCP DNS first, then public DNS fallback on the bound physical NIC.
-        var servers = snapshot.dnsServers
-        for fallbackDNS in ["1.1.1.1", "8.8.8.8"] where !servers.contains(fallbackDNS) {
+        var servers = Array(snapshot.dnsServers.prefix(3))
+        for fallbackDNS in fallbackServers where !servers.contains(fallbackDNS) {
             servers.append(fallbackDNS)
         }
-        let directAddrs = resolveViaDirectDNS(host: host, ifaceIndex: snapshot.ifaceIndex, dnsServers: servers)
+        var directAddrs: [IPAddress] = []
+        let lookupDeadline = min(deadline.addingTimeInterval(-3), Date().addingTimeInterval(5))
+        for server in servers {
+            let literal = server.split(separator: "%", maxSplits: 1).first.map(String.init) ?? ""
+            guard let address = IPAddress(literal), address.isUsable else { continue }
+            guard Date() < lookupDeadline else { break }
+            let answers = DNSAnswers()
+            DispatchQueue.concurrentPerform(iterations: 2) { index in
+                let type: UInt8 = index == 0 ? 1 : 28
+                answers.store(self.resolveViaDirectDNS(host: host, ifaceIndex: snapshot.ifaceIndex, server: address, type: type), type: type)
+            }
+            directAddrs = answers.combined
+            if !directAddrs.isEmpty || Date() >= lookupDeadline { break }
+        }
         if !directAddrs.isEmpty {
             lock.lock()
             dnsCache[host] = CachedAddresses(addresses: directAddrs, expiresAt: now + dnsCacheTTL)
@@ -569,22 +685,18 @@ final class GatewayRelay {
             return directAddrs
         }
 
-        // Fallback to system getaddrinfo only if non-fake IPv4 addresses are returned.
-        var sysAddrs: [in_addr] = []
+        var sysAddrs: [IPAddress] = []
         var hints = addrinfo()
-        hints.ai_family = AF_INET
+        hints.ai_family = AF_UNSPEC
         hints.ai_socktype = SOCK_STREAM
         var res: UnsafeMutablePointer<addrinfo>?
         if getaddrinfo(host, nil, &hints, &res) == 0, let first = res {
             defer { freeaddrinfo(first) }
             var cur: UnsafeMutablePointer<addrinfo>? = first
             while let node = cur {
-                if let sa = node.pointee.ai_addr {
-                    let sin = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
-                    let ip = UInt32(bigEndian: sin.sin_addr.s_addr)
-                    if (ip & surgeFakeNetMask) != surgeFakeNetBase {
-                        sysAddrs.append(sin.sin_addr)
-                    }
+                if let sa = node.pointee.ai_addr, [AF_INET, AF_INET6].contains(node.pointee.ai_family) {
+                    let address = IPAddress(sa)
+                    if address.isUsable { sysAddrs.append(address) }
                 }
                 cur = node.pointee.ai_next
             }
@@ -592,7 +704,7 @@ final class GatewayRelay {
         return sysAddrs
     }
 
-    private func resolveViaDirectDNS(host: String, ifaceIndex: UInt32, dnsServers: [String]) -> [in_addr] {
+    private func resolveViaDirectDNS(host: String, ifaceIndex: UInt32, server: IPAddress, type: UInt8) -> [IPAddress] {
         let txID = UInt16.random(in: 1...UInt16.max)
         var packet = Data([
             UInt8(txID >> 8), UInt8(txID & 0xFF),
@@ -604,42 +716,29 @@ final class GatewayRelay {
             packet.append(UInt8(bytes.count))
             packet.append(contentsOf: bytes)
         }
-        packet.append(contentsOf: [0x00, 0x00, 0x01, 0x00, 0x01])
+        packet.append(contentsOf: [0x00, 0x00, type, 0x00, 0x01])
 
-        for dnsServer in dnsServers {
-            let fd = Darwin.socket(AF_INET, SOCK_DGRAM, 0)
-            guard fd >= 0 else { continue }
+        do {
+            let fd = Darwin.socket(server.family, SOCK_DGRAM, 0)
+            guard fd >= 0 else { return [] }
             configureSocketFlags(fd)
             defer { Darwin.close(fd) }
 
-            var idx = ifaceIndex
-            guard setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &idx, socklen_t(MemoryLayout<UInt32>.size)) == 0 else {
+            guard bindInterface(fd, family: server.family, ifaceIndex: ifaceIndex) else {
                 return []
             }
             setUDPTimers(fd, seconds: dnsTimeoutSec)
 
-            var dnsAddr = sockaddr_in()
-            dnsAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-            dnsAddr.sin_family = sa_family_t(AF_INET)
-            dnsAddr.sin_port = UWConfig.dnsPort.bigEndian
-            guard inet_pton(AF_INET, dnsServer, &dnsAddr.sin_addr) == 1 else { continue }
-
-            // Connect the UDP socket so only packets from the queried resolver are accepted.
-            let connRes = withUnsafePointer(to: &dnsAddr) {
-                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                    Darwin.connect(fd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-                }
-            }
-            guard connRes == 0 else { continue }
+            guard server.connect(fd, port: UWConfig.dnsPort, ifaceIndex: ifaceIndex) == 0 else { return [] }
 
             let sent = packet.withUnsafeBytes { raw in
                 Darwin.send(fd, raw.baseAddress, packet.count, 0)
             }
-            guard sent == packet.count else { continue }
+            guard sent == packet.count else { return [] }
 
             var resp = [UInt8](repeating: 0, count: 1024)
             let n = Darwin.recv(fd, &resp, resp.count, 0)
-            guard n >= 12 else { continue }
+            guard n >= 12 else { return [] }
 
             let respID = (UInt16(resp[0]) << 8) | UInt16(resp[1])
             let flags = (UInt16(resp[2]) << 8) | UInt16(resp[3])
@@ -648,12 +747,12 @@ final class GatewayRelay {
             let rcode = flags & 0x000F
             let qdcount = (Int(resp[4]) << 8) | Int(resp[5])
             let ancount = (Int(resp[6]) << 8) | Int(resp[7])
-            guard respID == txID, isResponse, !isTruncated, rcode == 0, qdcount == 1 else { continue }
+            guard respID == txID, isResponse, !isTruncated, rcode == 0, qdcount == 1 else { return [] }
 
-            guard var pos = skipDNSName(resp, length: n, start: 12), pos + 4 <= n else { continue }
+            guard var pos = skipDNSName(resp, length: n, start: 12), pos + 4 <= n else { return [] }
             pos += 4 // QTYPE + QCLASS
 
-            var results: [in_addr] = []
+            var results: [IPAddress] = []
             for _ in 0..<ancount {
                 guard let afterName = skipDNSName(resp, length: n, start: pos),
                       afterName + 10 <= n else { break }
@@ -662,20 +761,26 @@ final class GatewayRelay {
                 let rdlen = (Int(resp[afterName + 8]) << 8) | Int(resp[afterName + 9])
                 let rdataStart = afterName + 10
                 guard rdataStart + rdlen <= n else { break }
-                if rtype == 1 && rclass == 1 && rdlen == 4 {
-                    let rawIP = (UInt32(resp[rdataStart]) << 24) |
-                                (UInt32(resp[rdataStart + 1]) << 16) |
-                                (UInt32(resp[rdataStart + 2]) << 8) |
-                                UInt32(resp[rdataStart + 3])
-                    if (rawIP & surgeFakeNetMask) != surgeFakeNetBase {
-                        results.append(in_addr(s_addr: rawIP.bigEndian))
+                let bytes = resp[rdataStart..<(rdataStart + rdlen)]
+                if rtype == UInt16(type) && rclass == 1 {
+                    let address: IPAddress?
+                    if type == 1 && rdlen == 4 {
+                        var value = in_addr()
+                        withUnsafeMutableBytes(of: &value) { $0.copyBytes(from: bytes) }
+                        address = .v4(value)
+                    } else if type == 28 && rdlen == 16 {
+                        var value = in6_addr()
+                        withUnsafeMutableBytes(of: &value) { $0.copyBytes(from: bytes) }
+                        address = .v6(value)
+                    } else {
+                        address = nil
                     }
+                    if let address, address.isUsable { results.append(address) }
                 }
                 pos = rdataStart + rdlen
             }
-            if !results.isEmpty { return results }
+            return results
         }
-        return []
     }
 
     private func skipDNSName(_ packet: [UInt8], length: Int, start: Int) -> Int? {
@@ -710,10 +815,4 @@ final class GatewayRelay {
         return nil
     }
 
-    private static func isUsableIPv4DNS(_ addr: String, fakeMask: UInt32, fakeBase: UInt32) -> Bool {
-        var sin = in_addr()
-        guard inet_pton(AF_INET, addr, &sin) == 1 else { return false }
-        let ip = UInt32(bigEndian: sin.s_addr)
-        return (ip & fakeMask) != fakeBase && ip != 0
-    }
 }

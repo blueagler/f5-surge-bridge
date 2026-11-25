@@ -1,49 +1,64 @@
-# F5 Surge Bridge (`UWVPN.app`)
+# UWVPN
 
-Run F5 BIG-IP SSL VPN (SAML + Duo MFA, built for **UW Husky OnNet**) as a **single userspace SOCKS5 node inside Surge Mac** — with zero kernel/utun routing conflicts, Surge Enhanced Mode kept on, and Keychain session persistence.
+UWVPN is a macOS menu bar app for F5 BIG-IP VPNs that use web sign-in. It exposes a fixed loopback SOCKS5 proxy for each configured gateway. The canonical UW gateways use `127.0.0.1:11080` for Surge. OpenConnect and a gVisor userspace stack carry TCP and UDP over the VPN without creating a system tunnel interface or changing macOS routes.
 
-## Why This Exists
+## Install and connect
 
-- **BIG-IP Edge Client** conflicts with **Surge Enhanced Mode** on macOS because Edge Client routes Surge's `198.18.0.0/15` fake-IP DNS block into the F5 `utun` tunnel.
-- Even **F5 Access for macOS** installs system `utun` routes (`10.0.0.0/8`, `172.16.0.0/12`, etc.) and cannot be used as a selective Surge outbound policy.
-- **UWVPN.app** replaces the system VPN tunnel with a local userspace stack (`openconnect --script-tun` + `ocproxy`) on `127.0.0.1:11080`:
-  - **Surge Enhanced Mode stays ON** (Headscale / Tailscale / Surge rules all work normally).
-  - **One tunnel, two modes via Surge**:
-    - Normal **Rule mode**: only campus routes/domains go through `UW-Campus -> UW-VPN` (and automatically fall back to `DIRECT` when disconnected).
-    - **Global Proxy -> `UW-VPN`**: temporarily route all traffic out through UW's public campus IP (using the default `huskyonnet-ns.uw.edu` gateway).
-  - **Session Persistence & Keepalive**: stores `MRHSession` + `F5_ST` (~72h) in macOS Keychain, detaches cleanly via `SIGHUP` on disconnect/quit without invalidating the server session, runs periodic `/vdesk/timeoutagent-i.php` keepalives, and reconnects automatically on wake or network changes.
+1. On macOS 26 or later, download `UWVPN-macOS-universal.zip`, unzip it, and move `UWVPN.app` to `/Applications`. [GitHub Releases](../../releases)
+2. Add the definitions in [surge/uw-vpn.conf](surge/uw-vpn.conf) to your Mac Surge profile. Set `udp-relay=true` on `UW-VPN` to use UDP through Surge.
+3. With Surge running, open UWVPN and choose **Install / Update Surge Module**. The app writes and enables rules for the configured gateway and login hosts.
+4. Choose **Connect (Web Login)** and complete UW NetID and Duo. Use **Campus Only** once to populate the campus split rules. In Surge Rule mode, the `UW-Campus` group prefers `UW-VPN` and uses `DIRECT` when the proxy is unavailable. To send all traffic through UW, select **All Internet** in UWVPN and use `UW-VPN` as the Surge Global Proxy policy.
 
-## Repository Layout
+The menu shows when the local proxy starts, whether the upstream probe succeeds, and when the probe fails. The app checks the UW test endpoint through SOCKS. A custom gateway without `healthCheckURL` shows its upstream as unverified. **Test VPN Connectivity** runs the same check on demand. Proxy hostnames resolve through F5-provided DNS. IPv6 destinations require an IPv6 address and route from the VPN gateway.
 
-- `src/UWVPN/` — Native Swift macOS menu bar app (`UWVPN.app`) + `tun-bridge.sh`
-- `scripts/` — Reproducible builds for portable `openconnect`, `ocproxy`, and `UWVPN.app` (links only Apple system dylibs)
-- `surge/` — Mac-only Surge profile snippet (`#!REQUIREMENT SYSTEM='macOS'`) and `#!system=mac` module template
-- `docs/` — [Architecture](docs/architecture.md) and [Code Review & Roadmap](docs/review-and-roadmap.md)
-- `prototypes/` — Early CLI/Swift proof-of-concept scripts from initial F5 SAML debugging
-- `.github/workflows/release.yml` — Automated macOS Universal (`arm64` + `x86_64`) build & GitHub Release workflow
+**Disconnect (Keep Session)** retains the session for reconnecting. **Sign Out & Clear Saved Session** stops the tunnel and reports failures in Keychain deletion, browser data removal, or server sign-out. If Keychain deletion fails, UWVPN blocks reuse of that saved session across launches.
 
-## Quick Start (Prebuilt Release)
+## Configure gateways
 
-1. Download `UWVPN-macOS-universal.zip` (or `arm64`/`x86_64`) from [Releases](../../releases), unzip, and move `UWVPN.app` to `/Applications/`.
-2. Install the Surge module (generates `uw-vpn.sgmodule` using your `$HOME` path):
-   ```zsh
-   ./surge/install-surge-module.sh
-   ```
-3. Add the macOS-only `UW-VPN` node and `UW-Campus` fallback group to your Mac Surge profile (see [`surge/Eagle-laptop.snippet.conf`](surge/Eagle-laptop.snippet.conf)), then enable the **UW Husky OnNet** module in Surge.
-4. Launch `UWVPN.app`, click the menu bar shield icon -> **Connect (UW Web Login)...**, and complete UW NetID + Duo once.
+Choose **Gateway → Edit Gateway Configuration** to open `~/Library/Application Support/UWVPN/config.json`. UW presets are included by default. For a custom F5 gateway, use a unique `id`, a display `name`, and a root HTTPS URL on port 443. Choose a `defaultGateway` ID. An existing menu selection takes precedence while its ID remains in the configuration.
 
-## Build From Source
-
-Requires Xcode Command Line Tools and OpenSSL static libraries (`openssl@3`):
-
-```zsh
-chmod +x scripts/build-helpers.sh scripts/build-app.sh
-./scripts/build-app.sh
+```json
+{
+  "defaultGateway": "work",
+  "gateways": [
+    {
+      "id": "work",
+      "name": "Work VPN",
+      "gatewayURL": "https://vpn.example.com/",
+      "splitRules": true
+    }
+  ],
+  "directHosts": ["login.example.com"]
+}
 ```
 
-Output bundle: `dist/UWVPN.app` (verified via `otool -L` to require no Homebrew/third-party dylibs at runtime).
+Each custom gateway gets a fixed loopback SOCKS port and Surge policy derived from its `id` and host. Set `healthCheckURL` to an HTTPS resource reachable through that gateway. This enables a Surge fallback group for its split routes. Without a probe, split routes target the gateway's SOCKS policy directly. The UW presets keep port `11080`, `UW-VPN`, and `UW-Campus`. The app rejects configurations with a port or policy collision.
 
-## Current Limitations
+`directHosts` optionally adds Surge exemptions for sign-in domains. After changing the configuration, relaunch UWVPN. Choose **Copy Custom Surge Policies** and paste the lines into the matching sections of your active Mac Surge profile. Replace any earlier definitions for those policies. Then run **Install / Update Surge Module**. Keep the definitions in [surge/uw-vpn.conf](surge/uw-vpn.conf) for the UW presets. Supported F5 sign-in flows issue both `MRHSession` and `F5_ST` cookies.
 
-- `ocproxy` supports **IPv4 TCP** over SOCKS5 (`CONNECT`); UDP relay and IPv6 literals are not yet supported (see [Roadmap](docs/review-and-roadmap.md)).
-- Default gateways target UW Husky OnNet (`huskyonnet-ns.uw.edu` and `huskyonnet.uw.edu`).
+The gateway relay resolves the VPN host using the physical interface's DNS servers. A gateway can list additional resolver IP addresses in `fallbackDNSServers`. The UW presets default to public fallback servers. Custom gateways default to an empty list. An explicit empty list disables those extra lookups. The relay also consults the macOS resolver if the direct lookups return no usable address. Traffic inside the VPN uses the DNS servers assigned by F5.
+
+## Build and test
+
+Use macOS 26 or later, Xcode, and Go 1.27.3 or newer. The script builds pinned OpenConnect and OpenSSL sources and writes the app to `dist/UWVPN.app`. It reuses a previously built OpenConnect binary in `build/helpers-<arch>/bin/` when the toolchain fingerprint matches.
+
+Personal builds use ad-hoc signing. `Info.plist` records the full Git revision, whether the checkout had local changes, and the distribution mode. Use these builds locally. GitHub Releases publishes Developer ID builds.
+
+```sh
+./scripts/build-app.sh
+python3 tests/build-release.py
+(cd src/tun-socks && CGO_ENABLED=0 go test -mod=readonly ./...)
+codesign --verify --deep --strict dist/UWVPN.app
+python3 tests/packaged-tunnel.py dist/UWVPN.app
+```
+
+See [AGENTS.md](AGENTS.md) for source entry points and verification commands. Pull-request CI builds Apple Silicon, Intel, and Universal archives without signing credentials. It extracts each archive and checks the packaged tunnel. A `vMAJOR.MINOR.PATCH` tag requires a clean checkout and produces Developer ID signed, hardened-runtime archives. Before publishing, CI notarizes all three apps, staples their tickets, verifies the extracted ZIPs with Gatekeeper, and reruns the tunnel check on the final Universal archive.
+
+Configure the `UWVPN_SIGN_IDENTITY` repository variable with the full Developer ID Application certificate name. Configure these repository secrets:
+
+- `UWVPN_DEVELOPER_ID_P12`: the base64-encoded Developer ID certificate and private key.
+- `UWVPN_DEVELOPER_ID_P12_PASSWORD`: the certificate import password.
+- `UWVPN_CI_KEYCHAIN_PASSWORD`: a strong, random password for temporary CI keychains.
+- `UWVPN_APPLE_ID`, `UWVPN_APPLE_PASSWORD`, and `UWVPN_TEAM_ID`: the Apple account and app-specific password used for notarization.
+
+The workflow stores notary credentials only in a temporary runner keychain. Keep certificates, keychain profiles, and notary credentials out of the repository and build logs. A missing signing identity, mismatched tag, ad-hoc public build, or failed notarization stops publication.
