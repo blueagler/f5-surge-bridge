@@ -5,7 +5,7 @@ set -euo pipefail
 : "${UWVPN_DEVELOPER_ID_P12_PASSWORD:?Set the certificate password.}"
 : "${UWVPN_CI_KEYCHAIN_PASSWORD:?Set a temporary keychain password.}"
 keychain="${UWVPN_KEYCHAIN:-${RUNNER_TEMP:?Set RUNNER_TEMP or UWVPN_KEYCHAIN}/release.keychain-db}"
-certificate="${RUNNER_TEMP:-${TMPDIR%/}}/developer-id.p12"
+certificate=$(mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/uwvpn-certificate.XXXXXXXX")
 trap 'rm -f -- "$certificate"' EXIT
 
 security create-keychain -p "$UWVPN_CI_KEYCHAIN_PASSWORD" "$keychain"

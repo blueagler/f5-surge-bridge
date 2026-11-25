@@ -48,7 +48,7 @@ codesign --verify --deep --strict dist/UWVPN.app
 python3 tests/packaged-tunnel.py dist/UWVPN.app
 ```
 
-See [AGENTS.md](AGENTS.md) for source entry points and verification commands. Pull-request CI builds Apple Silicon, Intel, and Universal archives without signing credentials. A `vMAJOR.MINOR.PATCH` tag requires a clean checkout and produces Developer ID signed, hardened-runtime archives. The release job submits all three archives for notarization, staples each app, runs Gatekeeper checks and `tests/packaged-tunnel.py`, then publishes the verified ZIPs.
+See [AGENTS.md](AGENTS.md) for source entry points and verification commands. Pull-request CI builds Apple Silicon, Intel, and Universal archives without signing credentials. It extracts each archive and checks the packaged tunnel. A `vMAJOR.MINOR.PATCH` tag requires a clean checkout and produces Developer ID signed, hardened-runtime archives. Before publishing, CI notarizes all three apps, staples their tickets, verifies the extracted ZIPs with Gatekeeper, and reruns the tunnel check on the final Universal archive.
 
 Configure the `UWVPN_SIGN_IDENTITY` repository variable with the full Developer ID Application certificate name. Configure these repository secrets:
 
