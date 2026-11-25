@@ -75,11 +75,9 @@ struct TunnelHealthLogout {
 
     static func makeRunner(
         probe: @escaping (UWGateway, UInt16, @escaping (TunnelProbeResult) -> Void) -> Void = { _, _, done in done(.upstream(.unverified)) },
-        clear: @escaping (UWGateway, @escaping (Result<Void, NSError>) -> Void) -> Void = { _, done in done(.success(())) }
+        clear: @escaping (UWGateway, @escaping (Result<Void, NSError>) -> Void) -> Void = { _, done in done(.success(())) },
+        defaults: UserDefaults = UserDefaults(suiteName: "com.blueagle.uwvpn.fixture.\(UUID().uuidString)")!
     ) -> TunnelRunner {
-        let suite = "com.blueagle.uwvpn.fixture.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        defaults.removePersistentDomain(forName: suite)
         return TunnelRunner(
             relay: relay, configuration: configuration, socksPort: 11081,
             clearWebsiteData: clear, tunnelProbe: probe,
@@ -101,7 +99,10 @@ struct TunnelHealthLogout {
         FixtureURLProtocol.deleted = false
         KeychainStore.clearError = NSError(domain: "FixtureKeychain", code: 17)
         var webCompletion: ((Result<Void, NSError>) -> Void)?
-        let runner = makeRunner(clear: { _, done in webCompletion = done })
+        let suite = "com.blueagle.uwvpn.fixture.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let runner = makeRunner(clear: { _, done in webCompletion = done }, defaults: defaults)
         var completed = false
         runner.disconnect(logoutOnServer: true) { result in
             guard case .failure(let error) = result else {
@@ -120,6 +121,7 @@ struct TunnelHealthLogout {
         webCompletion?(.success(()))
         RunLoop.main.run(until: Date().addingTimeInterval(0.2))
         precondition(completed && quitCompleted)
+        precondition(makeRunner(defaults: UserDefaults(suiteName: suite)!).inMemoryCachedSession() == nil)
         precondition(FixtureURLProtocol.requests.contains {
             $0.url?.path == "/vdesk/hangup.php3" && $0.value(forHTTPHeaderField: "Cookie")?.contains("fixture") == true
         })

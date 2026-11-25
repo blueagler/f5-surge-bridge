@@ -28,7 +28,6 @@ final class TunnelRunner {
     private enum StopIntent {
         case none
         case detach
-        case logout
     }
 
     private let relay: GatewayRelay
@@ -270,9 +269,8 @@ final class TunnelRunner {
             finishWebCleanup(.failure(NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut)))
         }
 
-        // The saved cookie remains usable after a detach or a helper failure.
-        let intent: StopIntent = processGateway == gw ? .logout : .detach
-        stopCurrentProcess(intent: intent) { [weak self, weak operation] in
+        // Detach leaves the session available for the explicit, observable F5 hangup.
+        stopCurrentProcess(intent: .detach) { [weak self, weak operation] in
             guard let self, let operation, self.logoutOperations[gw] === operation else { return }
             guard let session else {
                 operation.serverPending = false
@@ -512,6 +510,7 @@ final class TunnelRunner {
                 guard let self, self.generation == gen else { return }
                 self.activeLogin = nil
                 self.cachedSessions[gateway] = session
+                self.logoutErrors.removeValue(forKey: gateway)
                 if case .success = KeychainStore.save(session: session, gateway: gateway) {
                     self.defaults.removeObject(forKey: self.sessionRevocationKey(gateway))
                 }
@@ -767,10 +766,9 @@ final class TunnelRunner {
         }
         stopWaiters.append(completion)
         guard proc.isRunning else { return }
-        if stopIntent == .none || (stopIntent == .detach && intent == .logout) {
+        if stopIntent == .none {
             stopIntent = intent
-            let sig: Int32 = (intent == .logout) ? SIGTERM : SIGHUP
-            _ = kill(proc.processIdentifier, sig)
+            _ = kill(proc.processIdentifier, SIGHUP)
 
             let killItem = DispatchWorkItem { [weak self] in
                 guard let self, let active = self.process, active === proc, active.isRunning else { return }
@@ -778,7 +776,7 @@ final class TunnelRunner {
             }
             stopKillTimer?.cancel()
             stopKillTimer = killItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + (intent == .logout ? 2.0 : 1.2), execute: killItem)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: killItem)
         }
     }
 

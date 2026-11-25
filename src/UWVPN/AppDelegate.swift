@@ -100,8 +100,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = statusItem.button, let runner else { return }
         let symbolName: String
         switch runner.state {
-        case .connected:
+        case .connected(_, .upstreamAvailable):
             symbolName = "lock.shield.fill"
+        case .connected(_, .degraded):
+            symbolName = "exclamationmark.shield"
+        case .connected:
+            symbolName = "lock.shield"
         case .authenticating, .connecting, .signingOut, .reconnecting:
             symbolName = "arrow.triangle.2.circlepath"
         case .disconnected, .error:
@@ -142,14 +146,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .connecting:
             statusText = "Connecting to \(gw.shortLabel)…"
         case .connected(_, let health):
-            let healthText: String
             switch health {
-            case .localReady: healthText = "Checking upstream"
-            case .upstreamAvailable: healthText = "Upstream available"
-            case .degraded: healthText = "Upstream health check failed"
-            case .unverified: healthText = "Upstream unverified"
+            case .localReady: statusText = "Local proxy ready • Checking upstream"
+            case .upstreamAvailable: statusText = "Connected (\(gw.shortLabel)) • \(expiryLabel)"
+            case .degraded: statusText = "Local proxy ready • Upstream health check failed"
+            case .unverified: statusText = "Local proxy ready • Upstream unverified"
             }
-            statusText = "Connected (\(gw.shortLabel)) • \(healthText) • \(expiryLabel)"
         case .signingOut:
             statusText = "Signing out and clearing browser data…"
         case .reconnecting(let attempt):
