@@ -26,19 +26,22 @@ struct TunnelRecovery {
             precondition(error.localizedDescription.contains("timed out"))
         }
 
+        let healthOnly = CommandLine.arguments.contains("--health")
         let occupied = Darwin.socket(AF_INET, SOCK_STREAM, 0)
-        precondition(occupied >= 0)
-        var address = sockaddr_in()
-        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        address.sin_family = sa_family_t(AF_INET)
-        address.sin_port = port.bigEndian
-        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
-        let bound = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(occupied, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        if !healthOnly {
+            precondition(occupied >= 0)
+            var address = sockaddr_in()
+            address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            address.sin_family = sa_family_t(AF_INET)
+            address.sin_port = port.bigEndian
+            address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+            let bound = withUnsafePointer(to: &address) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.bind(occupied, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
             }
+            precondition(bound == 0 && Darwin.listen(occupied, 1) == 0)
         }
-        precondition(bound == 0 && Darwin.listen(occupied, 1) == 0)
 
         let relay = GatewayRelay(gateways: GatewayConfiguration.presets.gateways)
         var original = [Int32]()
@@ -46,6 +49,19 @@ struct TunnelRecovery {
         var sawOccupied = false
         var runner: TunnelRunner!
         runner = TunnelRunner(relay: relay, configuration: .presets, socksPort: port) {
+            if healthOnly {
+                if case .connected(_, .degraded) = runner.state, original.isEmpty {
+                    original = try! String(contentsOf: fixture, encoding: .utf8)
+                        .split(whereSeparator: \.isWhitespace).compactMap { Int32($0) }
+                    precondition(original.count == 2)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                        precondition(kill(original[0], 0) == 0)
+                        print("Silent upstream reported degraded without reconnecting")
+                        runner.quitAsync { exit(0) }
+                    }
+                }
+                return
+            }
             switch runner.state {
             case .connected:
                 let current = try! String(contentsOf: fixture, encoding: .utf8)
@@ -70,7 +86,9 @@ struct TunnelRecovery {
                 break
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { Darwin.close(occupied) }
+        if !healthOnly {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { Darwin.close(occupied) }
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 15) {
             runner.quitAsync { exit(1) }
         }

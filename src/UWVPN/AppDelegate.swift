@@ -77,12 +77,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        pathMonitor.cancel()
         guard let runner else {
             relay?.stop()
             return .terminateNow
         }
         runner.quitAsync { [weak self] in
+            self?.pathMonitor.cancel()
+            self?.networkDebounce?.cancel()
             self?.relay?.stop()
             NSApp.reply(toApplicationShouldTerminate: true)
         }
@@ -101,7 +102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch runner.state {
         case .connected:
             symbolName = "lock.shield.fill"
-        case .authenticating, .connecting, .reconnecting:
+        case .authenticating, .connecting, .signingOut, .reconnecting:
             symbolName = "arrow.triangle.2.circlepath"
         case .disconnected, .error:
             symbolName = "lock.shield"
@@ -125,7 +126,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let cached = runner.inMemoryCachedSession()
         let expiryLabel = cached?.remainingDescription.map { "\($0) left" } ?? "active"
         let statusText: String
-        switch runner.state {
+        if runner.isSigningOut {
+            statusText = "Signing out and clearing browser data…"
+        } else if let logoutError = runner.logoutError() {
+            statusText = "Sign-out incomplete: \(logoutError)"
+        } else { switch runner.state {
         case .disconnected:
             if let cached {
                 statusText = cached.remainingDescription.map { "Disconnected • Cached Session (\($0) left)" } ?? "Disconnected • Cached Session"
@@ -136,20 +141,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             statusText = gw.isUWPreset ? "Waiting for UW NetID / Duo…" : "Waiting for web login…"
         case .connecting:
             statusText = "Connecting to \(gw.shortLabel)…"
-        case .connected:
-            statusText = "Connected (\(gw.shortLabel)) • \(expiryLabel)"
+        case .connected(_, let health):
+            let healthText: String
+            switch health {
+            case .localReady: healthText = "Checking upstream"
+            case .upstreamAvailable: healthText = "Upstream available"
+            case .degraded: healthText = "Upstream health check failed"
+            case .unverified: healthText = "Upstream unverified"
+            }
+            statusText = "Connected (\(gw.shortLabel)) • \(healthText) • \(expiryLabel)"
+        case .signingOut:
+            statusText = "Signing out and clearing browser data…"
         case .reconnecting(let attempt):
             statusText = "Reconnecting (attempt \(attempt))…"
         case .error(let msg):
             statusText = "Error: \(msg)"
-        }
+        } }
         let statusRow = NSMenuItem(title: statusText, action: nil, keyEquivalent: "")
         statusRow.isEnabled = false
         menu.addItem(statusRow)
 
         menu.addItem(.separator())
 
-        if runner.state.isBusyOrUp {
+        if runner.isSigningOut {
+            let signingOut = NSMenuItem(title: "Signing Out…", action: nil, keyEquivalent: "")
+            signingOut.isEnabled = false
+            menu.addItem(signingOut)
+        } else if runner.state.isBusyOrUp {
             let disc = NSMenuItem(title: "Disconnect (Keep Session)", action: #selector(disconnectAction), keyEquivalent: "")
             disc.target = self
             menu.addItem(disc)
@@ -236,7 +254,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func signOutAction() {
-        runner?.disconnect(logoutOnServer: true)
+        runner?.disconnect(logoutOnServer: true) { [weak self] result in
+            if case .failure(let error) = result {
+                self?.showAlert("Sign-out incomplete", error.localizedDescription)
+            }
+        }
         rebuildMenu()
     }
 

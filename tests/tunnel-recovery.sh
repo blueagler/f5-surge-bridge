@@ -19,3 +19,10 @@ xcrun swiftc -swift-version 5 -warnings-as-errors -o "$app/MacOS/Health" \
     "$root/tests/TunnelRecovery.swift" \
     "$src/"{Models,GatewayRelay,SurgeModule,WebLoginWindow,TunnelController}.swift
 "$app/MacOS/Health" "$work/pids" "$port"
+
+xcrun swiftc -swift-version 5 -warnings-as-errors -o "$work/HealthLifecycle" \
+    "$root/tests/TunnelHealthLogout.swift" \
+    "$src/"{Models,GatewayRelay,SurgeModule,WebLoginWindow,TunnelController}.swift
+"$work/HealthLifecycle"
+
+"$app/MacOS/Health" "$work/health-pids" "$port" --health

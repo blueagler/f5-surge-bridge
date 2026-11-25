@@ -28,7 +28,8 @@ struct GatewayRoutingTests {
         _ = try GatewayConfiguration.load(from: legacy)
         let collision = work.appendingPathComponent("collision.json")
         let legacyUW = UWGateway.allInternet
-        let duplicateUW = UWGateway(id: "other-uw", name: "Other UW", gatewayURL: legacyUW.gatewayURL, splitRules: false)
+        var duplicateUW = UWGateway(id: "other-uw", name: "Other UW", gatewayURL: legacyUW.gatewayURL, splitRules: false)
+        duplicateUW.fallbackDNSServers = legacyUW.gatewayDNSFallback
         precondition(GatewayRoute(gateway: legacyUW).socksPort != GatewayRoute(gateway: duplicateUW).socksPort)
         let colliding = GatewayConfiguration(defaultGateway: "all", gateways: [legacyUW, duplicateUW], directHosts: nil)
         try JSONEncoder().encode(colliding).write(to: collision)

@@ -9,7 +9,9 @@ UWVPN is a macOS menu bar app for F5 BIG-IP VPNs that use web sign-in. It expose
 3. With Surge running, open UWVPN and choose **Install / Update Surge Module**. The app writes and enables rules for the configured gateway and login hosts.
 4. Choose **Connect (Web Login)** and complete UW NetID and Duo. Use **Campus Only** once to populate the campus split rules. In Surge Rule mode, the `UW-Campus` group prefers `UW-VPN` and uses `DIRECT` when the proxy is unavailable. To send all traffic through UW, select **All Internet** in UWVPN and use `UW-VPN` as the Surge Global Proxy policy.
 
-Use **Test VPN Connectivity** to check the active session. Proxy hostnames resolve through F5-provided DNS. IPv6 destinations require an IPv6 address and route from the VPN gateway.
+The menu shows when the local proxy starts, whether the upstream probe succeeds, and when the probe fails. The app checks the UW test endpoint through SOCKS. A custom gateway without `healthCheckURL` shows its upstream as unverified. **Test VPN Connectivity** runs the same check on demand. Proxy hostnames resolve through F5-provided DNS. IPv6 destinations require an IPv6 address and route from the VPN gateway.
+
+**Disconnect (Keep Session)** retains the session for reconnecting. **Sign Out & Clear Saved Session** stops the tunnel and reports failures in Keychain deletion, browser data removal, or server sign-out. If Keychain deletion fails, UWVPN blocks reuse of that saved session across launches.
 
 ## Configure gateways
 

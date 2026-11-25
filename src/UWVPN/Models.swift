@@ -10,8 +10,6 @@ struct UWGateway: Codable, Hashable {
     var fallbackDNSServers: [String]? = nil
     let healthCheckURL: URL?
 
-    var effectiveHealthCheckURL: URL? { healthCheckURL }
-
     init(id: String, name: String, gatewayURL: URL, splitRules: Bool?, healthCheckURL: URL? = nil) {
         self.id = id
         self.name = name
@@ -20,8 +18,8 @@ struct UWGateway: Codable, Hashable {
         self.healthCheckURL = healthCheckURL
     }
 
-    static let allInternet = UWGateway(id: "all", name: "All Internet", gatewayURL: URL(string: "https://huskyonnet-ns.uw.edu/")!, splitRules: false)
-    static let campusOnly = UWGateway(id: "campus", name: "Campus Only", gatewayURL: URL(string: "https://huskyonnet.uw.edu/")!, splitRules: true)
+    static let allInternet = UWGateway(id: "all", name: "All Internet", gatewayURL: URL(string: "https://huskyonnet-ns.uw.edu/")!, splitRules: false, healthCheckURL: nil)
+    static let campusOnly = UWGateway(id: "campus", name: "Campus Only", gatewayURL: URL(string: "https://huskyonnet.uw.edu/")!, splitRules: true, healthCheckURL: nil)
 
     var title: String { "\(name) (\(gatewayHost))" }
     var shortLabel: String { name }
@@ -32,7 +30,10 @@ struct UWGateway: Codable, Hashable {
         (id == Self.campusOnly.id && gatewayHost == Self.campusOnly.gatewayHost)
     }
     var gatewayDNSFallback: [String] {
-        fallbackDNSServers ?? (isUWPreset ? ["1.1.1.1", "2606:4700:4700::1111", "8.8.8.8"] : [])
+        fallbackDNSServers ?? (usesUWRoute ? ["1.1.1.1", "2606:4700:4700::1111", "8.8.8.8"] : [])
+    }
+    var effectiveHealthCheckURL: URL? {
+        healthCheckURL ?? (usesUWRoute ? URL(string: UWConfig.campusTestURL) : nil)
     }
     var ruleFileStem: String { "uw-\(webStoreUUID.uuidString.lowercased())" }
 
@@ -136,6 +137,14 @@ struct GatewayConfiguration: Codable {
             if let existing = dnsPolicies.updateValue(servers, forKey: gateway.gatewayHost), existing != servers {
                 throw ConfigurationError("Gateways on the same host must use the same fallbackDNSServers.")
             }
+            if let healthURL = gateway.healthCheckURL {
+                guard healthURL.scheme?.lowercased() == "https", healthURL.user == nil,
+                      URLComponents(url: healthURL, resolvingAgainstBaseURL: false)?.percentEncodedPassword == nil,
+                      healthURL.fragment == nil,
+                      let healthHost = healthURL.host, Self.isHostname(healthHost) else {
+                    throw ConfigurationError("Invalid healthCheckURL for \(gateway.id). Use an HTTPS URL without credentials or a fragment.")
+                }
+            }
         }
         guard ids.contains(defaultGateway) else { throw ConfigurationError("defaultGateway must match a gateway ID.") }
         let routes = gateways.map(GatewayRoute.init)
@@ -225,11 +234,24 @@ struct StoredSession: Codable, Equatable {
     }
 }
 
+enum TunnelHealth: Equatable {
+    case localReady
+    case upstreamAvailable
+    case degraded
+    case unverified
+}
+
+enum TunnelProbeResult: Equatable {
+    case localUnavailable
+    case upstream(TunnelHealth)
+}
+
 enum TunnelState: Equatable {
     case disconnected
     case authenticating
     case connecting
-    case connected(since: Date)
+    case connected(since: Date, health: TunnelHealth = .localReady)
+    case signingOut
     case reconnecting(attempt: Int)
     case error(String)
 
@@ -240,7 +262,7 @@ enum TunnelState: Equatable {
 
     var isBusyOrUp: Bool {
         switch self {
-        case .authenticating, .connecting, .connected, .reconnecting:
+        case .authenticating, .connecting, .connected, .signingOut, .reconnecting:
             return true
         case .disconnected, .error:
             return false
@@ -260,7 +282,6 @@ enum UWConfig {
     static let maxReconnectBackoffSec: TimeInterval = 30
     static let linuxUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     static let campusTestURL = "https://husky-onnet-test.uw.edu/vpn-test/"
-    static let publicIPTestURL = "https://api.ipify.org/"
     static let surgeCLIPath = "/Applications/Surge.app/Contents/Applications/surge-cli"
     static let supportDirectory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/UWVPN")
 }

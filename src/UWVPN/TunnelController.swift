@@ -3,6 +3,25 @@ import Darwin
 import Foundation
 import OSLog
 
+private final class LogoutOperation {
+    var webKitPending = true
+    var serverPending = true
+    var failures: [String] = []
+    var completions: [(Result<Void, NSError>) -> Void] = []
+}
+
+private final class GatewayRequestDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        if task.originalRequest?.url?.path == "/vdesk/hangup.php3" ||
+            request.url?.scheme != "https" || request.url?.host != task.originalRequest?.url?.host {
+            completionHandler(nil)
+        } else {
+            completionHandler(request)
+        }
+    }
+}
+
 final class TunnelRunner {
     private static let logger = Logger(subsystem: "com.blueagle.uwvpn", category: "Tunnel")
 
@@ -15,6 +34,7 @@ final class TunnelRunner {
     private let relay: GatewayRelay
     private let configuration: GatewayConfiguration
     private let socksPortOverride: UInt16?
+    private let tunnelProbe: (UWGateway, UInt16, @escaping (TunnelProbeResult) -> Void) -> Void
     private let onStateChange: () -> Void
 
     var socksPort: UInt16 {
@@ -34,17 +54,22 @@ final class TunnelRunner {
     private var readinessTimer: DispatchWorkItem?
     private var socksHealthTimer: Timer?
     private var socksHealthProbe: UUID?
+    private var socksHealthTimeout: DispatchWorkItem?
     private var socksHealthFailures = 0
+    private var nextUpstreamProbe = Date.distantPast
     private var refreshSessionAfterProbe = false
     private var reconnectWorkItem: DispatchWorkItem?
     private var keepaliveTimer: Timer?
     private var keepaliveTask: URLSessionDataTask?
     private var keepaliveRequest: UUID?
     private var activeLogin: WebLoginController?
-    private var clearingWebDataGateways: Set<UWGateway> = []
-    private var loggingOutGateways: Set<UWGateway> = []
+    private var logoutOperations: [UWGateway: LogoutOperation] = [:]
+    private var logoutErrors: [UWGateway: String] = [:]
     private var cachedSessions: [UWGateway: StoredSession] = [:]
     private let serverLogouts = DispatchGroup()
+    private var urlSession: URLSession?
+    private let clearWebsiteData: (UWGateway, @escaping (Result<Void, NSError>) -> Void) -> Void
+    private let configureSession: (URLSessionConfiguration) -> Void
 
     private var desiredConnected = false
     private var networkOnline = true
@@ -56,14 +81,14 @@ final class TunnelRunner {
             completion(succeeded)
         }
     }
-    private var urlSession: URLSession?
 
+    private let defaults: UserDefaults
     private let selectedGatewayKey = "selectedGateway"
     private let autoConnectKey = "autoConnect"
 
     var selectedGateway: UWGateway {
         get {
-            if let raw = UserDefaults.standard.string(forKey: selectedGatewayKey),
+            if let raw = defaults.string(forKey: selectedGatewayKey),
                let gw = configuration.gateways.first(where: { $0.id == raw }) {
                 return gw
             }
@@ -75,7 +100,7 @@ final class TunnelRunner {
             if wasUp {
                 disconnect(logoutOnServer: false)
             }
-            UserDefaults.standard.set(newValue.id, forKey: selectedGatewayKey)
+            defaults.set(newValue.id, forKey: selectedGatewayKey)
             onStateChange()
             if wasUp {
                 connect(forceLogin: false)
@@ -84,23 +109,61 @@ final class TunnelRunner {
     }
 
     var autoConnectEnabled: Bool {
-        get { UserDefaults.standard.bool(forKey: autoConnectKey) }
+        get { defaults.bool(forKey: autoConnectKey) }
         set {
-            UserDefaults.standard.set(newValue, forKey: autoConnectKey)
+            defaults.set(newValue, forKey: autoConnectKey)
             onStateChange()
         }
     }
 
     init(relay: GatewayRelay, configuration: GatewayConfiguration, socksPort: UInt16? = nil,
+         clearWebsiteData: @escaping (UWGateway, @escaping (Result<Void, NSError>) -> Void) -> Void = WebLoginController.clearWebsiteData,
+         tunnelProbe: ((UWGateway, UInt16, @escaping (TunnelProbeResult) -> Void) -> Void)? = nil,
+         configureSession: @escaping (URLSessionConfiguration) -> Void = { _ in },
+         defaults: UserDefaults = .standard,
          onStateChange: @escaping () -> Void) {
         self.relay = relay
         self.configuration = configuration
         self.socksPortOverride = socksPort
+        self.clearWebsiteData = clearWebsiteData
+        self.configureSession = configureSession
+        self.defaults = defaults
+        self.tunnelProbe = tunnelProbe ?? { gateway, socksPort, completion in
+            DispatchQueue.global(qos: .utility).async {
+                guard Self.probeSocks5Handshake(port: socksPort) else {
+                    completion(.localUnavailable)
+                    return
+                }
+                guard let url = gateway.effectiveHealthCheckURL else {
+                    completion(.upstream(.unverified))
+                    return
+                }
+                let probe = Process()
+                probe.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
+                probe.arguments = ["--disable", "--noproxy", "", "--proxy", "socks5h://\(UWConfig.loopbackHost):\(socksPort)",
+                                   "--fail", "--max-time", "4", "--output", "/dev/null", "--", url.absoluteString]
+                probe.standardOutput = FileHandle.nullDevice
+                probe.standardError = FileHandle.nullDevice
+                do {
+                    try probe.run()
+                    probe.waitUntilExit()
+                    completion(.upstream(probe.terminationStatus == 0 ? .upstreamAvailable : .degraded))
+                } catch {
+                    completion(.upstream(.degraded))
+                }
+            }
+        }
         self.onStateChange = onStateChange
         for gw in configuration.gateways {
             reloadKeychainCache(for: gw)
         }
     }
+
+    func logoutError(for gateway: UWGateway? = nil) -> String? {
+        logoutErrors[gateway ?? selectedGateway]
+    }
+
+    var isSigningOut: Bool { logoutOperations[selectedGateway] != nil }
 
     func inMemoryCachedSession(for gateway: UWGateway? = nil) -> StoredSession? {
         let gw = gateway ?? selectedGateway
@@ -124,9 +187,9 @@ final class TunnelRunner {
         readinessTimer = nil
 
         let gw = selectedGateway
-        if clearingWebDataGateways.contains(gw) || loggingOutGateways.contains(gw) {
+        if let operation = logoutOperations[gw] {
             state = .connecting
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            operation.completions.append { [weak self] _ in
                 guard let self, self.generation == gen, self.desiredConnected else { return }
                 self.connect(forceLogin: forceLogin)
             }
@@ -147,7 +210,7 @@ final class TunnelRunner {
         }
     }
 
-    func disconnect(logoutOnServer: Bool = false) {
+    func disconnect(logoutOnServer: Bool = false, completion: ((Result<Void, NSError>) -> Void)? = nil) {
         generation &+= 1
         let gen = generation
         desiredConnected = false
@@ -164,33 +227,87 @@ final class TunnelRunner {
         activeLogin = nil
 
         let gw = selectedGateway
-        if logoutOnServer {
-            let hadSession = cachedSessions[gw]
-            if hadSession != nil { loggingOutGateways.insert(gw) }
-            cachedSessions.removeValue(forKey: gw)
-            _ = KeychainStore.clear(gateway: gw)
-            if clearingWebDataGateways.insert(gw).inserted {
-                WebLoginController.clearWebsiteData(for: gw) { [weak self] in
-                    self?.clearingWebDataGateways.remove(gw)
-                }
-            }
-            // A detach already in progress may have sent SIGHUP, or the process
-            // may have already exited. Use the saved cookie to log out in either case.
-            let intent: StopIntent = processGateway == gw ? .logout : .detach
-            stopCurrentProcess(intent: intent) { [weak self] in
-                guard let self else { return }
-                if let hadSession {
-                    self.sendServerHangup(session: hadSession, gateway: gw, expectedGeneration: gen)
-                }
-                guard self.generation == gen else { return }
-                self.state = .disconnected
-            }
-        } else {
+        guard logoutOnServer else {
             stopCurrentProcess(intent: .detach) { [weak self] in
                 guard let self, self.generation == gen else { return }
                 self.state = .disconnected
+                completion?(.success(()))
+            }
+            return
+        }
+
+        if let existing = logoutOperations[gw] {
+            if let completion { existing.completions.append(completion) }
+            return
+        }
+        let operation = LogoutOperation()
+        if let completion { operation.completions.append(completion) }
+        logoutOperations[gw] = operation
+        logoutErrors.removeValue(forKey: gw)
+        state = .signingOut
+        serverLogouts.enter()
+        let session = cachedSessions[gw]
+        cachedSessions.removeValue(forKey: gw)
+        defaults.set(true, forKey: sessionRevocationKey(gw))
+        if case .failure(let error) = KeychainStore.clear(gateway: gw) {
+            operation.failures.append("The saved session could not be deleted from Keychain (\(error.code)).")
+        } else {
+            defaults.removeObject(forKey: sessionRevocationKey(gw))
+        }
+
+        let finishWebCleanup: (Result<Void, NSError>) -> Void = { [weak self, weak operation] result in
+            DispatchQueue.main.async {
+                guard let self, let operation, operation.webKitPending, self.logoutOperations[gw] === operation else { return }
+                operation.webKitPending = false
+                if case .failure(let error) = result {
+                    operation.failures.append("Browser sign-in data could not be cleared (\(error.code)).")
+                }
+                self.finishLogoutIfReady(gateway: gw, operation: operation)
             }
         }
+        clearWebsiteData(gw, finishWebCleanup)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 12) {
+            finishWebCleanup(.failure(NSError(domain: NSURLErrorDomain, code: NSURLErrorTimedOut)))
+        }
+
+        // The saved cookie remains usable after a detach or a helper failure.
+        let intent: StopIntent = processGateway == gw ? .logout : .detach
+        stopCurrentProcess(intent: intent) { [weak self, weak operation] in
+            guard let self, let operation, self.logoutOperations[gw] === operation else { return }
+            guard let session else {
+                operation.serverPending = false
+                self.finishLogoutIfReady(gateway: gw, operation: operation)
+                return
+            }
+            self.sendServerHangup(session: session, gateway: gw) { [weak self, weak operation] result in
+                guard let self, let operation, self.logoutOperations[gw] === operation else { return }
+                operation.serverPending = false
+                if case .failure(let error) = result {
+                    operation.failures.append(error.localizedDescription)
+                }
+                self.finishLogoutIfReady(gateway: gw, operation: operation)
+            }
+        }
+    }
+
+    private func finishLogoutIfReady(gateway: UWGateway, operation: LogoutOperation) {
+        guard logoutOperations[gateway] === operation, !operation.webKitPending, !operation.serverPending,
+              processGateway != gateway || process == nil else { return }
+        logoutOperations.removeValue(forKey: gateway)
+        let result: Result<Void, NSError>
+        if operation.failures.isEmpty {
+            logoutErrors.removeValue(forKey: gateway)
+            if selectedGateway == gateway && state == .signingOut { state = .disconnected }
+            result = .success(())
+        } else {
+            let message = operation.failures.joined(separator: " ")
+            logoutErrors[gateway] = message
+            if selectedGateway == gateway && state == .signingOut { state = .error(message) }
+            result = .failure(NSError(domain: "com.blueagle.uwvpn.logout", code: 1,
+                                      userInfo: [NSLocalizedDescriptionKey: message]))
+        }
+        for completion in operation.completions { completion(result) }
+        serverLogouts.leave()
     }
 
     func quitAsync(completion: @escaping () -> Void) {
@@ -270,7 +387,10 @@ final class TunnelRunner {
         socksHealthTimer?.invalidate()
         socksHealthTimer = nil
         socksHealthProbe = nil
+        socksHealthTimeout?.cancel()
+        socksHealthTimeout = nil
         socksHealthFailures = 0
+        nextUpstreamProbe = .distantPast
         refreshSessionAfterProbe = false
     }
 
@@ -281,36 +401,65 @@ final class TunnelRunner {
         guard socksHealthProbe == nil else { return }
         let gen = generation
         let probe = UUID()
+        let gw = selectedGateway
         socksHealthProbe = probe
-        let port = socksPort
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let ok = Self.probeSocks5Handshake(port: port)
+        let nowNeedsUpstreamProbe = gw.effectiveHealthCheckURL != nil && Date() >= nextUpstreamProbe
+        let timeoutResult: TunnelProbeResult = nowNeedsUpstreamProbe ? .upstream(.degraded) : .localUnavailable
+        let timeout = DispatchWorkItem { [weak self] in
+            self?.finishSocksHealthProbe(probe: probe, result: timeoutResult,
+                                         expectedGeneration: gen, process: proc, gateway: gw)
+        }
+        socksHealthTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: timeout)
+        let complete: (TunnelProbeResult) -> Void = { [weak self] result in
             DispatchQueue.main.async {
-                guard let self, self.socksHealthProbe == probe else { return }
-                self.socksHealthProbe = nil
-                guard self.generation == gen, self.process === proc, proc.isRunning,
-                      self.desiredConnected, self.state.isConnected, self.stopIntent == .none else { return }
-                if ok {
-                    self.socksHealthFailures = 0
-                    if case .connected(let since) = self.state, Date().timeIntervalSince(since) >= 60 {
-                        self.reconnectAttempts = 0
-                    }
-                    if self.refreshSessionAfterProbe {
-                        self.refreshSessionAfterProbe = false
-                        self.keepaliveTask?.cancel()
-                        self.keepaliveTask = nil
-                        self.keepaliveRequest = nil
-                        self.performKeepalive(expectedGeneration: gen)
-                    }
-                    return
-                }
-
-                self.socksHealthFailures += 1
-                guard self.socksHealthFailures >= 2 else { return }
-                Self.logger.error("SOCKS5 stopped responding while OpenConnect was running. Reconnecting with the saved session.")
-                self.retryAfterStopping(expectedGeneration: gen)
+                self?.finishSocksHealthProbe(probe: probe, result: result,
+                                             expectedGeneration: gen, process: proc, gateway: gw)
             }
         }
+        let port = socksPort
+        if nowNeedsUpstreamProbe {
+            nextUpstreamProbe = Date().addingTimeInterval(30)
+            tunnelProbe(gw, port, complete)
+        } else if gw.effectiveHealthCheckURL == nil {
+            tunnelProbe(gw, port, complete)
+        } else {
+            DispatchQueue.global(qos: .utility).async {
+                complete(Self.probeSocks5Handshake(port: port) ? .upstream(.localReady) : .localUnavailable)
+            }
+        }
+    }
+
+    private func finishSocksHealthProbe(probe: UUID, result: TunnelProbeResult,
+                                        expectedGeneration gen: UInt64, process proc: Process, gateway: UWGateway) {
+        guard socksHealthProbe == probe else { return }
+        socksHealthProbe = nil
+        socksHealthTimeout?.cancel()
+        socksHealthTimeout = nil
+        guard generation == gen, process === proc, proc.isRunning,
+              desiredConnected, state.isConnected, stopIntent == .none, selectedGateway == gateway else { return }
+        if case .upstream(let health) = result {
+            socksHealthFailures = 0
+            if case .connected(let since, let previous) = state, health != .localReady {
+                if previous != health { state = .connected(since: since, health: health) }
+                if health == .upstreamAvailable && Date().timeIntervalSince(since) >= 60 {
+                    reconnectAttempts = 0
+                }
+            }
+            if health != .degraded, refreshSessionAfterProbe {
+                refreshSessionAfterProbe = false
+                keepaliveTask?.cancel()
+                keepaliveTask = nil
+                keepaliveRequest = nil
+                performKeepalive(expectedGeneration: gen)
+            }
+            return
+        }
+
+        socksHealthFailures += 1
+        guard socksHealthFailures >= 2 else { return }
+        Self.logger.error("SOCKS5 stopped responding while OpenConnect was running. Reconnecting with the saved session.")
+        retryAfterStopping(expectedGeneration: gen)
     }
 
     private func retryAfterStopping(expectedGeneration gen: UInt64) {
@@ -327,6 +476,7 @@ final class TunnelRunner {
     }
 
     private func reloadKeychainCache(for gateway: UWGateway) {
+        guard !defaults.bool(forKey: sessionRevocationKey(gateway)) else { return }
         switch KeychainStore.load(gateway: gateway) {
         case .success(let session):
             if let session, session.isValidNow {
@@ -338,6 +488,8 @@ final class TunnelRunner {
             cachedSessions.removeValue(forKey: gateway)
         }
     }
+
+    private func sessionRevocationKey(_ gateway: UWGateway) -> String { "signedOut.\(gateway.sessionAccount)" }
 
     private func startWhenProcessStopped(generation gen: UInt64, intent: StopIntent = .detach, then action: @escaping () -> Void) {
         guard process != nil else {
@@ -360,7 +512,9 @@ final class TunnelRunner {
                 guard let self, self.generation == gen else { return }
                 self.activeLogin = nil
                 self.cachedSessions[gateway] = session
-                _ = KeychainStore.save(session: session, gateway: gateway)
+                if case .success = KeychainStore.save(session: session, gateway: gateway) {
+                    self.defaults.removeObject(forKey: self.sessionRevocationKey(gateway))
+                }
                 self.reconnectAttempts = 0
                 if self.desiredConnected && self.selectedGateway == gateway {
                     self.startOpenConnect(with: session, gateway: gateway, expectedGeneration: gen)
@@ -500,7 +654,7 @@ final class TunnelRunner {
                     return
                 }
                 if ready {
-                    self.state = .connected(since: Date())
+                    self.state = .connected(since: Date(), health: gateway.effectiveHealthCheckURL == nil ? .unverified : .localReady)
                     self.startSocksHealthMonitoring()
                     self.startKeepaliveTimer(expectedGeneration: gen)
                     if gateway.publishesSplitRules {
@@ -544,7 +698,7 @@ final class TunnelRunner {
         for waiter in waiters { waiter() }
 
         if activeStopIntent != .none || generation != procGeneration || !desiredConnected || selectedGateway != gateway {
-            if !desiredConnected && waiters.isEmpty {
+            if !desiredConnected && waiters.isEmpty && logoutOperations.isEmpty {
                 state = .disconnected
             }
             return
@@ -642,7 +796,8 @@ final class TunnelRunner {
         config.timeoutIntervalForRequest = 10
         config.timeoutIntervalForResource = 12
         config.httpShouldSetCookies = false
-        let s = URLSession(configuration: config)
+        configureSession(config)
+        let s = URLSession(configuration: config, delegate: GatewayRequestDelegate(), delegateQueue: nil)
         urlSession = s
         return s
     }
@@ -711,32 +866,35 @@ final class TunnelRunner {
         task.resume()
     }
 
-    private func sendServerHangup(session: StoredSession, gateway: UWGateway, expectedGeneration gen: UInt64) {
+    private func sendServerHangup(session: StoredSession, gateway: UWGateway,
+                                  completion: @escaping (Result<Void, NSError>) -> Void) {
         let url = gateway.gatewayURL.appendingPathComponent("vdesk/hangup.php3")
         var comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
         comps?.queryItems = [URLQueryItem(name: "hangup_error", value: "1")]
         guard let hangupURL = comps?.url else {
-            loggingOutGateways.remove(gateway)
+            completion(.failure(NSError(domain: "com.blueagle.uwvpn.logout", code: 1)))
             return
         }
         var req = URLRequest(url: hangupURL)
         req.setValue(UWConfig.linuxUserAgent, forHTTPHeaderField: "User-Agent")
         req.setValue(session.cookieHeader, forHTTPHeaderField: "Cookie")
-        let pending = serverLogouts
-        pending.enter()
-        managedURLSession().dataTask(with: req) { [weak self] _, response, error in
+        managedURLSession().dataTask(with: req) { _, response, error in
             let http = response as? HTTPURLResponse
-            let status = http?.statusCode ?? 0
-            let confirmed = error == nil && http?.url?.host?.lowercased() == gateway.gatewayHost &&
-                (200..<400).contains(status)
+            let fields = http?.allHeaderFields as? [String: String] ?? [:]
+            let cookies = HTTPCookie.cookies(withResponseHeaderFields: fields, for: hangupURL)
+            let deleted = cookies.contains {
+                $0.name == "MRHSession" && ($0.value == "deleted" || ($0.expiresDate.map { $0 <= Date() } ?? false))
+            }
+            let confirmed = error == nil && http?.url == hangupURL &&
+                (200..<400).contains(http?.statusCode ?? 0) && deleted
             DispatchQueue.main.async {
-                defer { pending.leave() }
-                guard let self else { return }
-                self.loggingOutGateways.remove(gateway)
-                guard !confirmed else { return }
-                Self.logger.error("Could not confirm F5 server logout.")
-                guard self.generation == gen else { return }
-                self.state = .error("Local session cleared. Server sign-out could not be confirmed.")
+                if confirmed {
+                    completion(.success(()))
+                } else {
+                    Self.logger.error("F5 server logout was not confirmed by explicit session-cookie deletion.")
+                    completion(.failure(NSError(domain: "com.blueagle.uwvpn.logout", code: 2,
+                                                userInfo: [NSLocalizedDescriptionKey: "F5 server sign-out could not be confirmed."])))
+                }
             }
         }.resume()
     }
@@ -744,65 +902,21 @@ final class TunnelRunner {
     func testConnection(completion: @escaping (String) -> Void) {
         let gw = selectedGateway
         let port = socksPort
-        DispatchQueue.global(qos: .userInitiated).async {
-            guard Self.probeSocks5Handshake(port: port) else {
-                DispatchQueue.main.async {
-                    completion("Not connected (SOCKS5 \(UWConfig.loopbackHost):\(port) did not respond).")
-                }
-                return
+        tunnelProbe(gw, port) { result in
+            let health: String
+            switch result {
+            case .localUnavailable:
+                health = "Local SOCKS5 proxy did not respond"
+            case .upstream(.unverified):
+                health = "Upstream health test: Unverified (no healthCheckURL configured)"
+            case .upstream(.degraded):
+                health = "Upstream health test (\(gw.effectiveHealthCheckURL?.host ?? gw.gatewayHost)): Failed"
+            case .upstream(.upstreamAvailable):
+                health = "Upstream health test (\(gw.effectiveHealthCheckURL?.host ?? gw.gatewayHost)): Available"
+            case .upstream(.localReady):
+                health = "Upstream health test: Local proxy ready"
             }
-
-            func curlViaSocks(_ url: String) -> (Int32, String) {
-                let proc = Process()
-                let out = Pipe()
-                let err = Pipe()
-                proc.executableURL = URL(fileURLWithPath: "/usr/bin/curl")
-                proc.arguments = ["-4", "--noproxy", "", "--proxy", "socks5h://\(UWConfig.loopbackHost):\(port)", "-fsSL", "--max-time", "10", url]
-                proc.standardOutput = out
-                proc.standardError = err
-                do {
-                    try proc.run()
-                    var outData = Data()
-                    let group = DispatchGroup()
-                    group.enter()
-                    DispatchQueue.global(qos: .utility).async {
-                        outData = out.fileHandleForReading.readData(ofLength: 65536)
-                        group.leave()
-                    }
-                    group.enter()
-                    DispatchQueue.global(qos: .utility).async {
-                        _ = err.fileHandleForReading.readData(ofLength: 8192)
-                        group.leave()
-                    }
-                    proc.waitUntilExit()
-                    group.wait()
-                    return (proc.terminationStatus, String(data: outData, encoding: .utf8) ?? "")
-                } catch {
-                    return (-1, "")
-                }
-            }
-
-            var lines = ["Gateway: \(gw.title)"]
-            if gw.isUWPreset {
-                let (uwCode, uwBody) = curlViaSocks(UWConfig.campusTestURL)
-                lines.append(uwCode == 0 && uwBody.contains("Success!")
-                             ? "Campus resource test: Success!"
-                             : "Campus resource test: Failed (exit \(uwCode))")
-            }
-
-            let (ipCode, ipBody) = curlViaSocks(UWConfig.publicIPTestURL)
-            let trimmedIP = ipBody.trimmingCharacters(in: .whitespacesAndNewlines)
-            let ipLine: String
-            if ipCode == 0 && !trimmedIP.isEmpty {
-                ipLine = "Public egress via VPN: \(trimmedIP)"
-            } else if gw.publishesSplitRules {
-                ipLine = "Public egress via VPN: Unavailable (the gateway may restrict public traffic)"
-            } else {
-                ipLine = "Public egress via VPN: Failed (exit \(ipCode))"
-            }
-
-            let summary = (lines + [ipLine]).joined(separator: "\n")
-            DispatchQueue.main.async { completion(summary) }
+            DispatchQueue.main.async { completion("Gateway: \(gw.title)\n\(health)") }
         }
     }
 

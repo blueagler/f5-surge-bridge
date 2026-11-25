@@ -90,12 +90,17 @@ final class WebLoginController: NSObject, NSWindowDelegate, WKNavigationDelegate
         NSApp.setActivationPolicy(.accessory)
     }
 
-    static func clearWebsiteData(for gateway: UWGateway, completion: (() -> Void)? = nil) {
+    static func clearWebsiteData(for gateway: UWGateway, completion: @escaping (Result<Void, NSError>) -> Void) {
         let store = WKWebsiteDataStore(forIdentifier: gateway.webStoreUUID)
         let types = WKWebsiteDataStore.allWebsiteDataTypes()
         store.removeData(ofTypes: types, modifiedSince: .distantPast) {
-            DispatchQueue.main.async {
-                completion?()
+            store.httpCookieStore.getAllCookies { cookies in
+                let remaining = cookies.contains {
+                    [gateway.gatewayHost, "." + gateway.gatewayHost].contains($0.domain.lowercased())
+                }
+                DispatchQueue.main.async {
+                    completion(remaining ? .failure(NSError(domain: "UWVPN.WebKitCleanup", code: 1)) : .success(()))
+                }
             }
         }
     }
