@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -85,6 +86,36 @@ def rule_lines(home, suffix):
     return [line for line in path.read_text().splitlines() if not line.startswith("#")]
 
 
+def check_udp_round_trip(peer, port):
+    target = socket.inet_aton("10.0.0.1")
+    payload = b"packaged UDP round trip"
+    with socket.create_connection(("127.0.0.1", port), timeout=2) as control, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+        control.sendall(b"\x05\x01\x00")
+        assert control.recv(2, socket.MSG_WAITALL) == b"\x05\x00"
+        control.sendall(b"\x05\x03\x00\x01" + b"\x00" * 6)
+        response = control.recv(10, socket.MSG_WAITALL)
+        assert response[:8] == b"\x05\x00\x00\x01\x7f\x00\x00\x01", response
+        relay_port = int.from_bytes(response[8:], "big")
+        request = b"\x00\x00\x00\x01" + target + struct.pack("!H", 4242) + payload
+        udp.settimeout(2)
+        udp.sendto(request, ("127.0.0.1", relay_port))
+
+        peer.settimeout(2)
+        outgoing = peer.recv(2048)
+        assert outgoing[0] == 0x45 and outgoing[9] == socket.IPPROTO_UDP, outgoing
+        assert outgoing[16:20] == target and outgoing[28:] == payload, outgoing
+        source_port, destination_port, length, _ = struct.unpack_from("!HHHH", outgoing, 20)
+        assert destination_port == 4242 and length == len(payload) + 8, outgoing
+        header = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + length, 0, 0, 64,
+                             socket.IPPROTO_UDP, 0, target, outgoing[12:16])
+        checksum = sum(struct.unpack("!10H", header))
+        checksum = (checksum >> 16) + (checksum & 0xffff)
+        checksum = ~((checksum >> 16) + (checksum & 0xffff)) & 0xffff
+        peer.send(header[:10] + struct.pack("!H", checksum) + header[12:] +
+                  struct.pack("!HHHH", destination_port, source_port, length, 0) + payload)
+        assert udp.recv(4096) == request
+
+
 def main():
     assert len(sys.argv) == 2, "usage: tests/packaged-tunnel.py path/to/UWVPN.app"
     app = Path(sys.argv[1]).resolve()
@@ -145,6 +176,8 @@ def main():
             wait_for_greeting(proc, port)
             assert not list((home / "Library" / "Application Support" / "UWVPN").glob("*.list"))
             print("PASS gateway with split rules disabled publishes no rules")
+            check_udp_round_trip(peer, port)
+            print("PASS packaged SOCKS5 UDP round trip over VPNFD")
         finally:
             stop_tunnel(proc, peer)
 
